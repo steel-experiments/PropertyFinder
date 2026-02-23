@@ -7,7 +7,7 @@ import html as html_lib
 import argparse
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import urljoin, urlparse, urlunparse, parse_qs
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -527,6 +527,51 @@ class PropertyFinder:
         words = re.findall(r'\b[a-zA-Z0-9]{2,}\b', prompt.lower())
         return [w for w in words if w not in stop_words]
 
+    def _infer_location_from_url(self) -> Optional[str]:
+        if not self.current_url:
+            return None
+        try:
+            parsed = urlparse(self.current_url)
+            query = parse_qs(parsed.query)
+        except Exception:
+            return None
+        keys = ("location", "city", "q", "query", "where", "destination", "dest", "ss", "search")
+        generic = {"hotel", "hotels", "apartment", "apartments", "property", "properties", "room", "rooms", "home", "homes", "rental", "rentals"}
+        for key in keys:
+            values = query.get(key) or []
+            if not values:
+                continue
+            candidate = re.sub(r"\s+", " ", str(values[0])).strip(" ,-")
+            candidate = re.sub(r"[^\w\s,.'-]", " ", candidate)
+            candidate = re.sub(r"\s+", " ", candidate).strip(" ,-")
+            low = candidate.lower()
+            if not candidate or len(low) < 3 or low.isdigit() or low in generic:
+                continue
+            return candidate
+        return None
+
+    def _sanitize_location(self, location: Any) -> Optional[str]:
+        if location is None:
+            return None
+        candidate = re.sub(r"\s+", " ", str(location)).strip(" ,-")
+        if not candidate:
+            return None
+        low = candidate.lower()
+        noise = {
+            "quiet", "small", "big", "cozy", "cosy", "good", "great", "fast",
+            "wifi", "wi fi", "internet", "budget", "cheap", "affordable",
+            "family", "luxury", "central", "center", "centre", "near",
+        }
+        if low in noise:
+            return None
+        keyword_set = {k.lower().strip() for k in self.keywords if k}
+        inferred = (self._infer_location_from_url() or "").lower()
+        if low in keyword_set and inferred and low != inferred:
+            return None
+        if re.fullmatch(r"\d+", low):
+            return None
+        return candidate
+
     def _parse_json_object(self, raw: str) -> dict:
         if not raw:
             return {}
@@ -639,6 +684,7 @@ If no healing is needed or unsure, return the original URL unchanged and an empt
     def _regex_parse(self, html: str) -> List[Dict]:
         listings = []
         seen = set()
+        inferred_location = self._infer_location_from_url()
         href_re = re.compile(r'href=["\']([^"\']*(?:rooms|listing|property|hotel|apartment|home)[^"\']*)["\']', re.IGNORECASE)
         for match in href_re.finditer(html):
             url = normalize_url(html_lib.unescape(match.group(1)), self.current_url)
@@ -661,11 +707,7 @@ If no healing is needed or unsure, return the original URL unchanged and an empt
             price = parse_number((price_match.group(1) or price_match.group(2)) if price_match else None)
             if price is not None and (price < 20 or price > 10000):
                 price = None
-            location = None
-            for kw in self.keywords:
-                if kw.isalpha() and len(kw) >= 3 and kw in snippet.lower():
-                    location = kw.title()
-                    break
+            location = inferred_location
             path = parsed.path
             slug = path.strip("/").split("/")[-1].replace(".html", "")
             name = re.sub(r"[-_]+", " ", slug).strip().title() or f"Listing {len(listings) + 1}"
@@ -691,6 +733,7 @@ If no healing is needed or unsure, return the original URL unchanged and an empt
         location = listing.get("location") or listing.get("city") or listing.get("subtitle")
         if isinstance(location, dict):
             location = location.get("name") or location.get("city")
+        location = self._sanitize_location(location)
         raw_price = listing.get("price")
         if raw_price is None:
             raw_price = listing.get("price_per_night")
@@ -725,10 +768,7 @@ If no healing is needed or unsure, return the original URL unchanged and an empt
             if guessed:
                 name = guessed
         if not location:
-            for kw in self.keywords:
-                if kw.isalpha() and len(kw) >= 3 and kw not in {"under", "over", "near", "cheap", "affordable"}:
-                    location = kw.title()
-                    break
+            location = self._infer_location_from_url()
         return {
             "name": name,
             "location": str(location).strip() if location else None,
@@ -898,6 +938,8 @@ If no healing is needed or unsure, return the original URL unchanged and an empt
 
         print("\n" + "=" * 65)
     def run(self, url: str, prompt: str, location: str = None):
+        print(f"\nStarting property finder run: {self.session_id}")
+        print("Preparing search URL...")
         try:
             final_url = url.format(query=prompt, location=location or "")
         except KeyError:
