@@ -12,7 +12,7 @@ Searches any property listing website and extracts:
 - URL to listing
 - Match Score (based on your keywords)
 
-Results are ranked by match score and saved to `results.json`.
+Results are ranked by match score and saved to `results_<session_id>.json`.
 
 ## Why This Demo?
 
@@ -21,7 +21,7 @@ This showcases realistic web automation challenges:
 ### Real-World Complexity
 - **Any Website**: Works with vacation-rental sites, real-estate sites, booking platforms, and similar listing sites
 - **Dynamic Content**: Handles JavaScript rendering via Steel
-- **Anti-Bot Detection**: Steel handles protection from major sites
+- **Anti-Bot Resilience**: Steel improves reliability on dynamic/protected sites
 - **Intelligent Extraction**: Works across different site structures
 
 ### Monitoring Points
@@ -58,7 +58,13 @@ Sign up and get your API keys
 
 ### 3. Configure Environment
 
-Create `.env` file:
+Copy the template and fill your keys:
+
+```bash
+cp .env.example .env
+```
+
+Then set values in `.env`:
 
 ```bash
 STEEL_API_KEY=ste_your_steel_key
@@ -89,6 +95,7 @@ python PropertyFinder.py --url <url> --prompt "<what you're looking for>"
 # Optional Arguments:
 #   --location    Location parameter for URL templates
 #   --keywords    Scoring keywords, comma-separated (default: extracted from prompt)
+#   --max-attempts  Max AI extraction attempts (default: 2)
 ```
 
 ### Examples
@@ -137,7 +144,7 @@ Steel session: 247f7e14-d470-4aae-b2b4-67f6668b2646
 Watch live: https://app.steel.dev/sessions/247f7e14-d470-4aae-b2b4-67f6668b2646
 Fetching: https://example-vacation-rental.com/search?location=Porec...
 Fetched 1351946 chars in 5.58s
-Saved to results.json
+Saved to results_search_20260219_135720.json
 
 =====================================================================
 RESULTS - Ranked by Match Score
@@ -167,12 +174,12 @@ Top result: Charming Apartment for Two
 =====================================================================
 
 Done! Found 11 results.
-See results.json for full data.
+See results_search_20260219_135720.json for full data.
 ```
 
 ## Output File
 
-Results are saved to `results.json`:
+Results are saved to `results_<session_id>.json`:
 
 ```json
 {
@@ -213,7 +220,7 @@ Results are saved to `results.json`:
 [10:30:03] ai_extraction (count: 11)
 [10:30:04] parse_listings (valid_count: 11)
 [10:30:04] results_found (count: 11)
-[10:30:04] results_saved (filename: results.json)
+[10:30:04] results_saved (filename: results_search_20260219_135720.json)
 [10:30:04] session_released
 [10:30:04] property_finder_run (results_found: 11)
 ```
