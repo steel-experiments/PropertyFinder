@@ -7,7 +7,7 @@ import html as html_lib
 import argparse
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
-from urllib.parse import urljoin, urlparse, urlunparse, parse_qs, urlencode
+from urllib.parse import urljoin, urlparse, urlunparse
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -91,7 +91,7 @@ def get_openai_client() -> OpenAI:
 
 class PropertyFinder:
 
-    def __init__(self, keywords: List[str] = None, max_attempts: int = 3):
+    def __init__(self, keywords: List[str] = None, max_attempts: int = 2):
         self.session_id = f"search_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.user_id = os.getenv("RAINDROP_USER_ID", "local-cli")
         self.client = None
@@ -101,8 +101,6 @@ class PropertyFinder:
         self.source_domain = ""
         self.prompt_text = ""
         self._session_scrape_param = None
-        self._desc_cache: Dict[str, str] = {}
-        self._desc_fetch_budget = 3
         self.results: List[Dict] = []
         self.keywords = keywords or []
 
@@ -223,38 +221,6 @@ class PropertyFinder:
             interaction.finish(output=f"Fetch failed: {e}")
             self._signal(interaction.id, "fetch_failure", "NEGATIVE", {"error": str(e)})
             raise
-
-    def _fetch_description(self, url: str) -> str:
-        final_url = normalize_url(url, self.current_url)
-        if not final_url:
-            return ""
-        try:
-            result = self._scrape_html(url=final_url, delay=2000)
-            html = result.content.html or ""
-
-            # Extract description text (usually in meta tags or specific divs)
-            desc_match = re.search(r'<meta[^>]+property="og:description"[^>]+content="([^"]+)"', html)
-            if desc_match:
-                return desc_match.group(1)
-
-            # Fallback: look for description in JSON-LD
-            json_matches = re.findall(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', html, re.DOTALL)
-            for match in json_matches:
-                try:
-                    data = json.loads(match)
-                    if isinstance(data, dict) and data.get("description"):
-                        return data["description"]
-                except:
-                    continue
-
-            return ""
-        except Exception as e:
-            self._track(
-                event="description_fetch_failed",
-                input_text=f"Fetch description from {url}",
-                output_text=str(e),
-            )
-            return ""
 
     def parse_listings(self, html: str, user_prompt: str = None) -> List[Dict[str, Any]]:
         interaction = raindrop.begin(
@@ -425,24 +391,36 @@ class PropertyFinder:
         non_generic_ratio = non_generic / total
         return {"count": total, "url_ratio": round(url_ratio, 3), "price_ratio": round(price_ratio, 3), "non_generic_ratio": round(non_generic_ratio, 3), "good": total >= 5 and url_ratio >= 0.6 and non_generic_ratio >= 0.6 and price_ratio >= 0.2}
 
-    def _telemetry_hints(self, user_prompt: str) -> str:
+    def _query_events(self, query: str, search_in: str = "assistant_output", limit: int = 10, silent: bool = False):
         try:
             client = get_query_client()
-            results = client.events.search(
-                query=f"{self.source_domain} listing extraction url price rating {user_prompt}",
+            return client.events.search(
+                query=query,
                 mode="semantic",
-                search_in="assistant_output",
-                limit=5,
+                search_in=search_in,
+                limit=limit,
             )
-            items = results.data if hasattr(results, "data") else (results if isinstance(results, list) else [])
-            hints = []
-            for item in items:
-                out = (getattr(item, "assistant_output", "") or "").replace("\n", " ").strip()
-                if out:
-                    hints.append(out[:140])
-            return "\n".join(hints[:4])
-        except Exception:
+        except Exception as e:
+            if not silent:
+                print(f"Query failed: {e}")
+            return None
+
+    def _telemetry_hints(self, user_prompt: str) -> str:
+        results = self._query_events(
+            query=f"{self.source_domain} listing extraction url price rating {user_prompt}",
+            search_in="assistant_output",
+            limit=5,
+            silent=True,
+        )
+        if not results:
             return ""
+        items = results.data if hasattr(results, "data") else (results if isinstance(results, list) else [])
+        hints = []
+        for item in items:
+            out = (getattr(item, "assistant_output", "") or "").replace("\n", " ").strip()
+            if out:
+                hints.append(out[:140])
+        return "\n".join(hints[:4])
 
     def _extract_with_ai(self, html: str, user_prompt: str) -> List[Dict]:
         interaction = raindrop.begin(
@@ -548,6 +526,81 @@ class PropertyFinder:
         }
         words = re.findall(r'\b[a-zA-Z0-9]{2,}\b', prompt.lower())
         return [w for w in words if w not in stop_words]
+
+    def _parse_json_object(self, raw: str) -> dict:
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except Exception:
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if not match:
+                return {}
+            try:
+                data = json.loads(match.group(0))
+            except Exception:
+                return {}
+        return data if isinstance(data, dict) else {}
+
+    def _heal_search_url_with_llm(self, url: str) -> str:
+        if not url:
+            return url
+        parsed = urlparse(url)
+        if not parsed.netloc:
+            return url
+        try:
+            client = get_openai_client()
+        except Exception:
+            return url
+
+        today = datetime.now().date()
+        fallback_checkin = (today + timedelta(days=14)).isoformat()
+        fallback_checkout = (today + timedelta(days=16)).isoformat()
+
+        prompt = f"""
+You are a URL healing assistant for property search websites.
+Return a single JSON object only.
+Schema:
+  {{"healed_url":"...", "applied_parameters":["k=v", ...], "reason":"..."}}
+
+Goal:
+- Add missing query params only when required for property search pages to return results.
+- Preserve scheme, host, and existing path.
+- Do not change the host domain.
+- Keep existing query params unless explicitly missing.
+
+Context:
+- Original URL: {url}
+- Today (for relative date defaults): {today.isoformat()}
+- Typical booking-style defaults if needed: checkin={fallback_checkin}, checkout={fallback_checkout}, group_adults=2, no_rooms=1, group_children=0
+
+If no healing is needed or unsure, return the original URL unchanged and an empty applied_parameters list.
+"""
+
+        try:
+            response = client.responses.create(
+                model="gpt-5-mini",
+                instructions="Return valid JSON only following the provided schema.",
+                input=prompt,
+                text={"format": {"type": "json_object"}},
+            )
+            data = self._parse_json_object(response.output_text or "")
+            healed = (data.get("healed_url") or "").strip()
+            if not healed:
+                return url
+
+            parsed_healed = urlparse(healed)
+            if not parsed_healed.scheme or not parsed_healed.netloc:
+                return url
+
+            original_host = parsed.netloc.lower().replace("www.", "")
+            healed_host = parsed_healed.netloc.lower().replace("www.", "")
+            if healed_host == original_host or healed_host.endswith(f".{original_host}"):
+                return healed
+        except Exception:
+            return url
+
+        return url
 
     def _extract_from_json(self, data, max_depth: int = 8, max_nodes: int = 3000) -> List[Dict]:
         results = []
@@ -726,13 +779,6 @@ class PropertyFinder:
         listing_url = listing.get("url") or ""
         if listing_url and not self._looks_like_listing_url(listing_url):
             return 0.0
-        if not description and listing_url and self._looks_like_listing_url(listing_url) and self._desc_fetch_budget > 0:
-            if listing_url not in self._desc_cache:
-                self._desc_cache[listing_url] = self._fetch_description(listing_url)
-                self._desc_fetch_budget -= 1
-            description = self._desc_cache.get(listing_url, "")
-            if description:
-                listing["description"] = description
         text_to_check = f"{description} {listing.get('name', '')} {listing.get('location') or ''}".lower()
         text_tokens = set(re.findall(r"\b[a-z0-9]+\b", text_to_check))
         for keyword in self.keywords:
@@ -802,48 +848,20 @@ class PropertyFinder:
 
     def search_past_runs(self, query: str, limit: int = 10):
         print(f"\nSearching past runs for: \"{query}\"")
-        try:
-            client = get_query_client()
-            results = client.events.search(
-                query=query,
-                mode="semantic",
-                search_in="assistant_output",
-                limit=limit,
-            )
-            return results
-        except Exception as e:
-            print(f"Query failed: {e}")
-            return None
+        return self._query_events(query=query, search_in="assistant_output", limit=limit, silent=False)
 
     def find_similar(self, description: str, limit: int = 10):
         print(f"\nFinding results similar to: \"{description}\"")
-        try:
-            client = get_query_client()
-            results = client.events.search(
-                query=description,
-                mode="semantic",
-                search_in="user_input",
-                limit=limit,
-            )
-            return results
-        except Exception as e:
-            print(f"Query failed: {e}")
-            return None
+        return self._query_events(query=description, search_in="user_input", limit=limit, silent=False)
 
     def find_issues(self, limit: int = 10):
         print(f"\nFinding sessions with issues...")
-        try:
-            client = get_query_client()
-            results = client.events.search(
-                query="slow fetch failure error timeout problem",
-                mode="semantic",
-                search_in="assistant_output",
-                limit=limit,
-            )
-            return results
-        except Exception as e:
-            print(f"Query failed: {e}")
-            return None
+        return self._query_events(
+            query="slow fetch failure error timeout problem",
+            search_in="assistant_output",
+            limit=limit,
+            silent=False,
+        )
 
     def display_query_results(self, results, title: str = "Query Results"):
         print("\n" + "=" * 65)
@@ -887,11 +905,8 @@ class PropertyFinder:
         final_url = normalize_url(final_url)
         if not final_url:
             raise ValueError("Invalid final URL")
+        final_url = self._heal_search_url_with_llm(final_url)
         source_domain = urlparse(final_url).netloc.lower().replace("www.", "")
-        if source_domain.endswith("booking.com"):
-            p = urlparse(final_url); q = parse_qs(p.query)
-            if "checkin" not in q or "checkout" not in q:
-                d = datetime.now().date(); q.setdefault("checkin", [(d + timedelta(days=14)).isoformat()]); q.setdefault("checkout", [(d + timedelta(days=16)).isoformat()]); q.setdefault("group_adults", ["2"]); q.setdefault("no_rooms", ["1"]); q.setdefault("group_children", ["0"]); final_url = urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q, doseq=True), p.fragment))
         self.current_url = final_url
         self.source_domain = urlparse(final_url).netloc.lower().replace("www.", "")
         self.prompt_text = prompt.lower()
@@ -954,7 +969,7 @@ def main():
     parser.add_argument("--keywords", help="Scoring keywords (comma-separated)")
     parser.add_argument("--similar", help="Find similar past discoveries")
     parser.add_argument("--issues", action="store_true", help="Find sessions with problems")
-    parser.add_argument("--max-attempts", type=int, default=3, help="Max AI extraction attempts in the agentic loop")
+    parser.add_argument("--max-attempts", type=int, default=2, help="Max AI extraction attempts in the agentic loop")
 
     args = parser.parse_args()
     # Parse keywords
