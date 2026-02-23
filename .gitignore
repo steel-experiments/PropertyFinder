@@ -18,3 +18,4 @@ __pycache__/
 # Generated output files
 potential_swamps.json
 results.json
+results_search_*.json

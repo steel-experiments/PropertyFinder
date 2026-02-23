@@ -1,16 +1,13 @@
-"""
-Property Finder
-Searches any website for properties/listings using Steel, monitored by Raindrop.
-Includes semantic query search via Raindrop Query SDK.
-"""
+"""Property Finder using Steel, OpenAI, and Raindrop."""
 
 import os
 import re
 import json
-import sys
+import html as html_lib
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
+from urllib.parse import urljoin, urlparse, urlunparse, parse_qs, urlencode
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -20,14 +17,60 @@ import raindrop.analytics as raindrop
 from raindrop_query import RaindropQuery
 from openai import OpenAI
 
-raindrop.init(os.getenv("RAINDROP_WRITE_KEY"))
-
 # Lazy-initialized clients
 _query_client = None
 _openai_client = None
 
+def require_env(keys: List[str]):
+    missing = [key for key in keys if not os.getenv(key)]
+    if missing:
+        raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
+
+
+def normalize_url(url: str, base_url: str = "") -> str:
+    value = (url or "").strip()
+    if not value:
+        return ""
+    if value.startswith("//"):
+        value = "https:" + value
+    if base_url:
+        value = urljoin(base_url, value)
+    if value.startswith("/") and not base_url:
+        return ""
+    parsed = urlparse(value)
+    if not parsed.scheme:
+        parsed = urlparse("https://" + value)
+    if not parsed.netloc:
+        return ""
+    return urlunparse((parsed.scheme.lower() or "https", parsed.netloc.lower(), parsed.path, parsed.params, parsed.query, ""))
+
+
+def parse_number(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    cleaned = re.sub(r"[^\d,.\-]", "", text)
+    if not cleaned:
+        return None
+    if "," in cleaned and "." in cleaned:
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    elif "," in cleaned and "." not in cleaned:
+        parts = cleaned.split(",")
+        cleaned = "".join(parts[:-1]) + "." + parts[-1] if len(parts[-1]) in (1, 2) else "".join(parts)
+    try:
+        return float(cleaned)
+    except ValueError:
+        match = re.search(r"-?\d+(?:\.\d+)?", cleaned)
+        return float(match.group(0)) if match else None
+
 def get_query_client() -> RaindropQuery:
-    """Get or create the Raindrop Query SDK client."""
     global _query_client
     if _query_client is None:
         api_key = os.getenv("RAINDROP_QUERY_API_KEY")
@@ -37,7 +80,6 @@ def get_query_client() -> RaindropQuery:
     return _query_client
 
 def get_openai_client() -> OpenAI:
-    """Get or create the OpenAI client."""
     global _openai_client
     if _openai_client is None:
         api_key = os.getenv("OPENAI_API_KEY")
@@ -48,25 +90,25 @@ def get_openai_client() -> OpenAI:
 
 
 class PropertyFinder:
-    """
-    Steel manages the cloud browser session.
-    steel.scrape() retrieves clean text/HTML from each URL.
-    Raindrop tracks every step with begin()/finish() and track_signal().
-    """
 
-    def __init__(self, keywords: List[str] = None):
+    def __init__(self, keywords: List[str] = None, max_attempts: int = 3):
         self.session_id = f"search_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        self.client = Steel(steel_api_key=os.getenv("STEEL_API_KEY"))
+        self.user_id = os.getenv("RAINDROP_USER_ID", "local-cli")
+        self.client = None
         self.session = None
+        self.max_attempts = max(1, max_attempts)
+        self.current_url = ""
+        self.source_domain = ""
+        self.prompt_text = ""
+        self._session_scrape_param = None
+        self._desc_cache: Dict[str, str] = {}
+        self._desc_fetch_budget = 3
         self.results: List[Dict] = []
         self.keywords = keywords or []
 
-    # Raindrop helpers
-
     def _track(self, event: str, input_text: str, output_text: str, props: dict = None):
-        """Log a discrete step to Raindrop."""
         raindrop.track_ai(
-            user_id=self.session_id,
+            user_id=self.user_id,
             event=event,
             input=input_text,
             output=output_text,
@@ -74,7 +116,6 @@ class PropertyFinder:
         )
 
     def _signal(self, event_id: str, name: str, sentiment: str = "POSITIVE", props: dict = None):
-        """Attach a signal/alert to an existing Raindrop event."""
         raindrop.track_signal(
             event_id=event_id,
             name=name,
@@ -82,11 +123,41 @@ class PropertyFinder:
             properties=props or {},
         )
 
-    # Session lifecycle
+    def _get_steel_client(self) -> Steel:
+        if self.client is None:
+            api_key = os.getenv("STEEL_API_KEY")
+            if not api_key:
+                raise ValueError("STEEL_API_KEY not set in environment")
+            self.client = Steel(steel_api_key=api_key)
+        return self.client
+
+    def _scrape_html(self, url: str, delay: int = 3000):
+        client = self._get_steel_client()
+        final_url = normalize_url(url, self.current_url)
+        if not final_url:
+            raise ValueError(f"Invalid URL: {url}")
+        kwargs = {"url": final_url, "format": ["html"], "delay": delay}
+        if self.session:
+            session_keys = ["session_id", "session"]
+            if self._session_scrape_param:
+                session_keys = [self._session_scrape_param] + [k for k in session_keys if k != self._session_scrape_param]
+            for key in session_keys:
+                try:
+                    result = client.scrape(**kwargs, **{key: self.session.id})
+                    self._session_scrape_param = key
+                    return result
+                except TypeError:
+                    continue
+                except Exception as exc:
+                    msg = str(exc).lower()
+                    if "unexpected keyword" in msg or "unexpected argument" in msg:
+                        continue
+                    raise
+        return client.scrape(**kwargs)
 
     def start_session(self):
         t0 = datetime.now()
-        self.session = self.client.sessions.create()
+        self.session = self._get_steel_client().sessions.create()
         duration = (datetime.now() - t0).total_seconds()
 
         self._track(
@@ -104,7 +175,7 @@ class PropertyFinder:
 
     def end_session(self):
         if self.session:
-            self.client.sessions.release(self.session.id)
+            self._get_steel_client().sessions.release(self.session.id)
             self._track(
                 event="session_released",
                 input_text=f"Release session {self.session.id}",
@@ -112,15 +183,9 @@ class PropertyFinder:
             )
             print("Session released")
 
-    # Content Retrieval
-
     def scrape_url(self, url: str) -> str:
-        """
-        Fetch page content as HTML using steel.scrape().
-        Steel handles JS rendering, anti-bot protection, and CAPTCHAs.
-        """
         interaction = raindrop.begin(
-            user_id=self.session_id,
+            user_id=self.user_id,
             event="page_fetch",
             input=f"Fetch URL: {url}",
             properties={"url": url},
@@ -130,10 +195,9 @@ class PropertyFinder:
             print(f"Fetching: {url}")
             t0 = datetime.now()
 
-            result = self.client.scrape(
+            result = self._scrape_html(
                 url=url,
-                format=["html"],  # return full rendered HTML
-                delay=3000,       # wait 3s for JS to render
+                delay=3000,
             )
             content = result.content.html or ""
 
@@ -161,13 +225,11 @@ class PropertyFinder:
             raise
 
     def _fetch_description(self, url: str) -> str:
-        """Fetch property description from a listing page."""
+        final_url = normalize_url(url, self.current_url)
+        if not final_url:
+            return ""
         try:
-            result = self.client.scrape(
-                url=f"https://{url}",
-                format=["html"],
-                delay=2000,
-            )
+            result = self._scrape_html(url=final_url, delay=2000)
             html = result.content.html or ""
 
             # Extract description text (usually in meta tags or specific divs)
@@ -195,12 +257,8 @@ class PropertyFinder:
             return ""
 
     def parse_listings(self, html: str, user_prompt: str = None) -> List[Dict[str, Any]]:
-        """
-        Parse listing data out of HTML.
-        Strategy: AI extraction first, then JSON-LD, then regex fallback.
-        """
         interaction = raindrop.begin(
-            user_id=self.session_id,
+            user_id=self.user_id,
             event="parse_listings",
             input=f"Parse listings from {len(html)} chars of HTML",
         )
@@ -219,27 +277,37 @@ class PropertyFinder:
                         props={"count": len(listings), "method": "ai"},
                     )
 
-            # --- Strategy 2: JSON-LD structured data (fallback) ---
-            if not listings:
-                json_ld_matches = re.findall(
-                    r'<script[^>]+type="application/json"[^>]*>(.*?)</script>',
-                    html, re.DOTALL
+            # --- Strategy 2: structured scripts fallback ---
+            if len(listings) < 3:
+                script_matches = re.findall(
+                    r'<script[^>]+type="application/(ld\+json|json)"[^>]*>(.*?)</script>',
+                    html,
+                    re.DOTALL | re.IGNORECASE,
                 )
 
-                for match in json_ld_matches:
+                structured_count = 0
+                for script_type, match in script_matches:
                     try:
                         data = json.loads(match)
-                        extracted = self._extract_from_json(data)
-                        listings.extend(extracted)
                     except Exception:
                         continue
 
-                if listings:
+                    if script_type.lower() == "ld+json":
+                        extracted = self._extract_from_json(data, max_depth=8, max_nodes=2500)
+                    else:
+                        lower = match.lower()
+                        if not any(token in lower for token in ["listing", "property", "itemlistelement", "offers", "price"]):
+                            continue
+                        extracted = self._extract_from_json(data, max_depth=7, max_nodes=1200)
+                    structured_count += len(extracted)
+                    listings.extend(extracted)
+
+                if structured_count:
                     self._track(
                         event="json_parse_success",
-                        input_text="Parse JSON-LD from HTML",
-                        output_text=f"{len(listings)} listings from JSON",
-                        props={"count": len(listings), "method": "json_ld"},
+                        input_text="Parse structured scripts from HTML",
+                        output_text=f"{structured_count} listings from structured scripts",
+                        props={"count": structured_count, "method": "structured_scripts"},
                     )
 
             # --- Strategy 3: Regex fallback if AI and JSON-LD gave nothing ---
@@ -253,12 +321,15 @@ class PropertyFinder:
 
             # Validate, score, deduplicate
             valid = []
-            seen_names = set()
-            for listing in listings:
-                if self._is_valid(listing) and listing["name"] not in seen_names:
-                    listing["match_score"] = self._calculate_score(listing)
-                    valid.append(listing)
-                    seen_names.add(listing["name"])
+            seen_keys = set()
+            for raw_listing in listings:
+                listing = self._normalize_listing(raw_listing)
+                key = self._dedupe_key(listing)
+                if key in seen_keys or not self._is_valid(listing):
+                    continue
+                listing["match_score"] = self._calculate_score(listing)
+                valid.append(listing)
+                seen_keys.add(key)
 
             self.results = valid
 
@@ -278,262 +349,409 @@ class PropertyFinder:
             self._signal(interaction.id, "parse_failure", "NEGATIVE", {"error": str(e)})
             raise
 
-    def _prepare_content(self, html: str, max_chars: int = 350000) -> str:
-        """Prepare HTML content for AI analysis by removing noise."""
-        # Remove scripts, styles, comments to reduce noise
+    def _prepare_content(self, html: str, max_chars: int = 180000) -> str:
         clean = re.sub(r'<(script|style|noscript)[^>]*>.*?</\1>', '', html, flags=re.DOTALL | re.IGNORECASE)
         clean = re.sub(r'<!--.*?-->', '', clean, flags=re.DOTALL)
         clean = re.sub(r'<svg[^>]*>.*?</svg>', '', clean, flags=re.DOTALL | re.IGNORECASE)
-        clean = re.sub(r'<head[^>]*>.*?</head>', '', clean, flags=re.DOTALL | re.IGNORECASE)
+        return clean[:max_chars]
 
-        # Truncate if needed (gpt-5-mini has 400k context window)
-        if len(clean) > max_chars:
-            clean = clean[:max_chars]
+    def _extract_candidate_blocks(self, html: str, limit: int = 120) -> List[str]:
+        blocks = []
+        href_re = re.compile(r'href=["\']([^"\']*(?:rooms|listing|property|hotel|apartment|home)[^"\']*)["\']', re.IGNORECASE)
+        for match in href_re.finditer(html):
+            url = normalize_url(html_lib.unescape(match.group(1)), self.current_url)
+            if not url or not self._looks_like_listing_url(url):
+                continue
+            start = max(0, match.start() - 1400)
+            end = min(len(html), match.end() + 2200)
+            block = html[start:end]
+            if not re.search(r"(?:\$|€|£|\bUSD\b|\bEUR\b|\bGBP\b|\bHRK\b|\bnight\b|\bper\s+night\b|\bprice\b)", block, re.IGNORECASE):
+                continue
+            blocks.append(block)
+            if len(blocks) >= limit:
+                break
+        return list(dict.fromkeys(blocks))
 
-        return clean
+    def _parse_ai_payload(self, raw: str) -> List[Dict]:
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except Exception:
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if not match:
+                return []
+            try:
+                data = json.loads(match.group(0))
+            except Exception:
+                return []
+        if isinstance(data, dict):
+            if isinstance(data.get("listings"), list):
+                return data["listings"]
+            if isinstance(data.get("results"), list):
+                return data["results"]
+            if isinstance(data.get("items"), list):
+                return data["items"]
+            return []
+        return data if isinstance(data, list) else []
+
+    def _is_generic_name(self, name: str) -> bool:
+        value = (name or "").strip().lower()
+        return bool(re.match(r"^(listing|property)\s+\d+$", value)) or value in {"unknown", "unknown property", "listing"}
+
+    def _looks_like_listing_url(self, url: str) -> bool:
+        if not url:
+            return False
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").lower()
+        path = (parsed.path or "").lower()
+        if not host:
+            return False
+        if self.source_domain and not host.endswith(self.source_domain):
+            return False
+        if path.endswith((".css", ".js", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".map", ".xml", ".txt", ".json", ".pdf", ".mp4", ".webm")):
+            return False
+        return any(token in path for token in ("/hotel/", "/room/", "/rooms/", "/listing/", "/property/", "/apartment/", "/apartments/", "/home/", "/homes/", "/stay/", "/villa/", "/house/"))
+
+    def _quality(self, listings: List[Dict]) -> Dict[str, float]:
+        total = len(listings)
+        if total == 0:
+            return {"count": 0, "url_ratio": 0.0, "price_ratio": 0.0, "non_generic_ratio": 0.0, "good": False}
+        with_url = sum(1 for x in listings if x.get("url") and self._looks_like_listing_url(x.get("url")))
+        with_price = sum(1 for x in listings if x.get("price") is not None)
+        non_generic = sum(1 for x in listings if not self._is_generic_name(x.get("name", "")))
+        url_ratio = with_url / total
+        price_ratio = with_price / total
+        non_generic_ratio = non_generic / total
+        return {"count": total, "url_ratio": round(url_ratio, 3), "price_ratio": round(price_ratio, 3), "non_generic_ratio": round(non_generic_ratio, 3), "good": total >= 5 and url_ratio >= 0.6 and non_generic_ratio >= 0.6 and price_ratio >= 0.2}
+
+    def _telemetry_hints(self, user_prompt: str) -> str:
+        try:
+            client = get_query_client()
+            results = client.events.search(
+                query=f"{self.source_domain} listing extraction url price rating {user_prompt}",
+                mode="semantic",
+                search_in="assistant_output",
+                limit=5,
+            )
+            items = results.data if hasattr(results, "data") else (results if isinstance(results, list) else [])
+            hints = []
+            for item in items:
+                out = (getattr(item, "assistant_output", "") or "").replace("\n", " ").strip()
+                if out:
+                    hints.append(out[:140])
+            return "\n".join(hints[:4])
+        except Exception:
+            return ""
 
     def _extract_with_ai(self, html: str, user_prompt: str) -> List[Dict]:
-        """Use OpenAI to extract property listings from HTML."""
         interaction = raindrop.begin(
-            user_id=self.session_id,
+            user_id=self.user_id,
             event="ai_extraction",
             input=f"Extract listings using AI for: {user_prompt}",
         )
 
         try:
-            # Prepare content for AI
-            content = self._prepare_content(html)
-
             client = get_openai_client()
+            cleaned = self._prepare_content(html)
+            card_blocks = self._extract_candidate_blocks(html)
+            script_blocks = re.findall(r'<script[^>]+type="application/(?:ld\+json|json)"[^>]*>(.*?)</script>', html, re.DOTALL | re.IGNORECASE)
+            script_blob = "\n\n".join(x[:8000] for x in script_blocks if any(t in x.lower() for t in ["listing", "property", "price", "offers"]))[:60000]
+            chunks = []
+            if card_blocks:
+                chunks.append(("candidate_cards", "\n\n".join(card_blocks)[:100000]))
+            if script_blob:
+                chunks.append(("structured_json", script_blob))
+            chunks.extend([(f"clean_html_{i+1}", chunk) for i, chunk in enumerate([cleaned[:90000], cleaned[90000:180000]]) if chunk])
+            if not chunks:
+                chunks = [("raw_html", html[:90000])]
 
-            # Use Responses API for gpt-5-mini
-            response = client.responses.create(
-                model="gpt-5-mini",
-                instructions="""You are a property listing extractor. Analyze HTML and extract ALL property/listing data you can find.
+            telemetry_hints = self._telemetry_hints(user_prompt)
+            combined: List[Dict] = []
+            feedback = ""
+            attempts = min(self.max_attempts, len(chunks))
 
-IMPORTANT: Extract as MANY listings as possible. Be thorough and exhaustive.
+            for i in range(attempts):
+                source, content = chunks[i]
+                instructions = (
+                    "Extract property/accommodation listings as strict JSON object: "
+                    "{\"listings\":[{\"name\":\"\",\"location\":null,\"price\":null,\"currency\":null,\"url\":null,\"rating\":null,\"description\":null}]}. "
+                    "Extract as many real listing cards/results as possible. Keep price numeric. "
+                    "Do not return CSS/JS/image/static asset URLs; return only real listing detail URLs. "
+                    "For each listing, include card-level location and price if visible."
+                )
+                if telemetry_hints:
+                    instructions += f"\nPast telemetry hints:\n{telemetry_hints}"
+                if feedback:
+                    instructions += f"\nPrevious attempt feedback:\n{feedback}"
 
-Look for:
-- Property cards, search results, listing items
-- URLs containing /rooms/, /hotel/, /listing/, /property/, /nekretnine/
-- Price patterns (numbers with currency symbols)
-- Rating values (usually 0-5 scale)
-- Location names (cities, neighborhoods)
+                response = client.responses.create(
+                    model="gpt-5-mini",
+                    instructions=instructions,
+                    input=f"User intent: {user_prompt}\nSource: {source}\n\nContent:\n{content}\n\nReturn JSON only.",
+                    text={"format": {"type": "json_object"}},
+                )
 
-Return ONLY valid JSON with a "listings" array containing objects with:
-- name: property title (string) - extract from titles, headings, aria-labels
-- price: numeric value only, no currency symbols (number or null)
-- currency: currency code like EUR, USD, GBP, HRK (string or null)
-- location: city/area name (string or null)
-- url: full or relative URL to the listing (string or null)
-- rating: rating value if available (number or null)
+                parsed = self._parse_ai_payload(response.output_text or "")
+                attempt_listings = [self._normalize_listing(item) for item in parsed if isinstance(item, dict)]
+                attempt_listings = [x for x in attempt_listings if x.get("url") or not self._is_generic_name(x.get("name", ""))]
+                combined = self._dedupe_listings(combined + attempt_listings)
+                quality = self._quality(combined)
 
-Extract EVERY listing you find, not just a few examples. If no listings found, return: {"listings": []}""",
-                input=f"""Extract ALL property listings from this HTML. Be thorough - extract every single listing you can find.
+                self._track(
+                    event="agentic_iteration",
+                    input_text=f"AI attempt {i+1} ({source})",
+                    output_text=f"{quality['count']} listings, url_ratio={quality['url_ratio']}, price_ratio={quality['price_ratio']}",
+                    props={"attempt": i + 1, "source": source, **quality},
+                )
 
-User's search intent: {user_prompt}
+                if quality["good"]:
+                    break
+                if quality["url_ratio"] < 0.6:
+                    feedback = "Need more real listing URLs. Exclude static assets and non-listing links."
+                elif quality["non_generic_ratio"] < 0.6:
+                    feedback = "Need real listing titles, not generic names."
+                else:
+                    feedback = "Need more listing prices."
 
-HTML content:
-{content}
-
-Return JSON with all listings found:""",
-                text={
-                    "format": {
-                        "type": "json_object"
-                    }
-                }
-            )
-
-            raw_content = response.output_text
-            data = json.loads(raw_content)
-
-            # Extract listings from response
-            listings = data.get("listings", data if isinstance(data, list) else [])
-
-            # Normalize listings to expected format
-            normalized = []
-            for item in listings:
-                listing = {
-                    "name": item.get("name", "Unknown Property"),
-                    "location": item.get("location") or "Unknown",
-                    "price_per_night": item.get("price"),
-                    "currency": item.get("currency"),
-                    "url": item.get("url"),
-                    "rating": item.get("rating"),
-                }
-                normalized.append(listing)
+            if not quality["good"]:
+                self._track(
+                    event="ai_extraction_low_quality",
+                    input_text=f"Extract listings for: {user_prompt}",
+                    output_text=f"Rejected AI output with url_ratio={quality['url_ratio']}, price_ratio={quality['price_ratio']}",
+                    props={**quality, "method": "agentic_loop"},
+                )
+                interaction.finish(output=f"AI extraction low quality ({quality['count']} candidates), falling back", properties=quality)
+                return []
 
             self._track(
                 event="ai_extraction_success",
                 input_text=f"Extract listings for: {user_prompt}",
-                output_text=f"{len(normalized)} listings extracted via AI",
-                props={"count": len(normalized), "model": "gpt-5-mini"},
+                output_text=f"{len(combined)} listings extracted via AI loop",
+                props={"count": len(combined), "model": "gpt-5-mini", "method": "agentic_loop", "attempts": attempts},
             )
-
-            interaction.finish(
-                output=f"AI extracted {len(normalized)} listings",
-                properties={"count": len(normalized)},
-            )
-
-            return normalized
+            interaction.finish(output=f"AI extracted {len(combined)} listings", properties={"count": len(combined), "attempts": attempts})
+            return combined
 
         except Exception as e:
             interaction.finish(output=f"AI extraction failed: {e}")
             self._signal(interaction.id, "ai_extraction_failure", "NEGATIVE", {"error": str(e)})
-            self._track(
-                event="ai_extraction_failed",
-                input_text=f"Extract listings for: {user_prompt}",
-                output_text=str(e),
-            )
-            # Return empty list on failure - will fall back to regex
+            self._track(event="ai_extraction_failed", input_text=f"Extract listings for: {user_prompt}", output_text=str(e))
             return []
 
     def _extract_keywords(self, prompt: str) -> List[str]:
-        """Extract relevant keywords from user's natural language prompt."""
         stop_words = {
             "find", "looking", "for", "in", "the", "a", "an", "with", "near",
             "cheap", "affordable", "want", "need", "please", "show", "search",
             "apartment", "apartments", "house", "houses", "room", "rooms",
             "property", "properties", "listing", "listings"
         }
-        words = re.findall(r'\b[a-zA-Z]{3,}\b', prompt.lower())
+        words = re.findall(r'\b[a-zA-Z0-9]{2,}\b', prompt.lower())
         return [w for w in words if w not in stop_words]
 
-    def _extract_from_json(self, data) -> List[Dict]:
-        """Recursively hunt for listing objects in parsed JSON."""
+    def _extract_from_json(self, data, max_depth: int = 8, max_nodes: int = 3000) -> List[Dict]:
         results = []
+        state = {"nodes": 0}
 
-        if isinstance(data, dict):
-            name = (data.get("name") or data.get("title") or "").strip()
-            price_raw = (
-                str(data.get("price") or data.get("priceString") or
-                    data.get("priceValue") or "")
-            )
-            rating_raw = str(
-                data.get("rating") or data.get("starRating") or
-                data.get("avgRating") or ""
-            )
-            location = (
-                data.get("location") or data.get("city") or
-                data.get("neighborhood") or data.get("subtitle") or ""
-            )
-            if isinstance(location, dict):
-                location = location.get("name") or location.get("city") or ""
+        def walk(node: Any, depth: int):
+            if depth > max_depth or state["nodes"] >= max_nodes:
+                return
+            state["nodes"] += 1
+            if isinstance(node, dict):
+                name = str(node.get("name") or node.get("title") or "").strip()
+                price = node.get("price") or node.get("priceString") or node.get("priceValue")
+                rating = node.get("rating") or node.get("starRating") or node.get("avgRating")
+                location = node.get("location") or node.get("city") or node.get("neighborhood") or node.get("subtitle")
+                if isinstance(location, dict):
+                    location = location.get("name") or location.get("city") or location.get("addressLocality")
+                url = node.get("url") or node.get("link") or node.get("@id")
+                if name and (price is not None or rating is not None or url):
+                    results.append({
+                        "name": name,
+                        "location": str(location).strip() if location else None,
+                        "price": parse_number(price),
+                        "currency": node.get("currency") or node.get("priceCurrency"),
+                        "rating": parse_number(rating),
+                        "url": url,
+                    })
+                for value in node.values():
+                    walk(value, depth + 1)
+            elif isinstance(node, list):
+                for item in node[:300]:
+                    walk(item, depth + 1)
 
-            price_match = re.search(r"\$?(\d+)", str(price_raw))
-            rating_match = re.search(r"(\d+\.?\d*)", str(rating_raw))
-
-            if name and (price_match or rating_match):
-                listing = {
-                    "name": name,
-                    "location": str(location) if location else "Unknown",
-                    "price_per_night": int(price_match.group(1)) if price_match else None,
-                    "rating": float(rating_match.group(1)) if rating_match else None,
-                }
-                results.append(listing)
-
-            # Recurse into nested values
-            for v in data.values():
-                results.extend(self._extract_from_json(v))
-
-        elif isinstance(data, list):
-            for item in data:
-                results.extend(self._extract_from_json(item))
-
+        walk(data, 0)
         return results
 
     def _regex_parse(self, html: str) -> List[Dict]:
-        # Strip tags to get plain text
-        text = re.sub(r"<[^>]+>", " ", html)
-        text = re.sub(r"\s+", " ", text)
-
-        # Find prices (looking for $XX patterns)
-        prices = re.findall(r"\$(\d+)", text)
-
-        # Find ratings (4.0-5.0 range)
-        ratings = re.findall(r"\b([4-5]\.\d{1,2})\b", text)
-
-        # Extract property URLs from HTML
-        property_urls = []
-        for url in re.findall(r'/rooms/(\d+)', html):
-            property_urls.append(f"example-vacation-site.com/rooms/{url}")
-        property_urls = list(dict.fromkeys(property_urls))
-
-        # Try to find location hints
-        locations = re.findall(
-            r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2},?\s+[A-Z]{2})",
-            text
-        )
-
         listings = []
-        count = min(len(prices), len(ratings), 10)
-
-        for i in range(count):
-            url = property_urls[i] if i < len(property_urls) else None
-            location = locations[i].strip() if i < len(locations) else "Unknown"
-
+        seen = set()
+        href_re = re.compile(r'href=["\']([^"\']*(?:rooms|listing|property|hotel|apartment|home)[^"\']*)["\']', re.IGNORECASE)
+        for match in href_re.finditer(html):
+            url = normalize_url(html_lib.unescape(match.group(1)), self.current_url)
+            if not url or not self._looks_like_listing_url(url):
+                continue
+            parsed = urlparse(url)
+            path_key = re.sub(r"/+$", "", parsed.path or "") or "/"
+            canonical = urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path_key, "", "", ""))
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            start = max(0, match.start() - 1200)
+            end = min(len(html), match.end() + 2200)
+            snippet = html_lib.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html[start:end])))
+            price_match = re.search(
+                r"(?:€|\$|£|USD|EUR|GBP|HRK)\s*([0-9][0-9.,]{1,8})|([0-9][0-9.,]{1,8})\s*(?:€|\$|£|USD|EUR|GBP|HRK)",
+                snippet,
+                re.IGNORECASE,
+            )
+            price = parse_number((price_match.group(1) or price_match.group(2)) if price_match else None)
+            if price is not None and (price < 20 or price > 10000):
+                price = None
+            location = None
+            for kw in self.keywords:
+                if kw.isalpha() and len(kw) >= 3 and kw in snippet.lower():
+                    location = kw.title()
+                    break
+            path = parsed.path
+            slug = path.strip("/").split("/")[-1].replace(".html", "")
+            name = re.sub(r"[-_]+", " ", slug).strip().title() or f"Listing {len(listings) + 1}"
             listings.append({
-                "name": url or f"Property {i + 1}",
+                "name": name,
                 "location": location,
-                "price_per_night": int(prices[i]),
-                "rating": float(ratings[i]),
+                "price": price,
+                "rating": None,
+                "url": canonical,
             })
-
+            if len(listings) >= 10:
+                break
         self._track(
             event="regex_parse",
             input_text="Regex fallback parse",
             output_text=f"{len(listings)} listings via regex",
-            props={"count": len(listings), "prices_found": len(prices), "urls_found": len(property_urls)},
+            props={"count": len(listings), "urls_found": len(seen)},
         )
         return listings
 
-    # Scoring & validation
+    def _normalize_listing(self, listing: Dict) -> Dict:
+        name = str(listing.get("name") or listing.get("title") or "").strip()
+        location = listing.get("location") or listing.get("city") or listing.get("subtitle")
+        if isinstance(location, dict):
+            location = location.get("name") or location.get("city")
+        raw_price = listing.get("price")
+        if raw_price is None:
+            raw_price = listing.get("price_per_night")
+        price = parse_number(raw_price)
+        rating = parse_number(listing.get("rating") or listing.get("score"))
+        if rating is not None and rating > 5 and rating <= 10:
+            rating = rating / 2.0
+        if rating is not None and rating < 1:
+            rating = None
+        currency = listing.get("currency")
+        if isinstance(currency, str):
+            currency = currency.strip().upper() or None
+        elif isinstance(raw_price, str):
+            upper = raw_price.upper()
+            if "€" in raw_price or "EUR" in upper:
+                currency = "EUR"
+            elif "$" in raw_price or "USD" in upper:
+                currency = "USD"
+            elif "£" in raw_price or "GBP" in upper:
+                currency = "GBP"
+        raw_url = html_lib.unescape(str(listing.get("url") or listing.get("link") or ""))
+        url = normalize_url(raw_url, self.current_url)
+        if url:
+            parsed = urlparse(url)
+            path = re.sub(r"/+$", "", parsed.path or "") or "/"
+            url = urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", "", ""))
+        if url and not self._looks_like_listing_url(url):
+            url = None
+        if (not name or self._is_generic_name(name)) and url:
+            slug = urlparse(url).path.strip("/").split("/")[-1].replace(".html", "")
+            guessed = re.sub(r"[-_]+", " ", slug).strip().title()
+            if guessed:
+                name = guessed
+        if not location:
+            for kw in self.keywords:
+                if kw.isalpha() and len(kw) >= 3 and kw not in {"under", "over", "near", "cheap", "affordable"}:
+                    location = kw.title()
+                    break
+        return {
+            "name": name,
+            "location": str(location).strip() if location else None,
+            "price": price,
+            "currency": currency,
+            "rating": rating,
+            "url": url or None,
+            "description": listing.get("description"),
+        }
+
+    def _dedupe_key(self, listing: Dict):
+        if listing.get("url"):
+            parsed = urlparse(html_lib.unescape(listing["url"]))
+            path = re.sub(r"/+$", "", parsed.path or "") or "/"
+            canonical = urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", "", ""))
+            return ("url", canonical)
+        return ("fallback", listing.get("name", "").lower(), (listing.get("location") or "").lower(), listing.get("price"))
+
+    def _dedupe_listings(self, listings: List[Dict]) -> List[Dict]:
+        seen = set()
+        out = []
+        for listing in listings:
+            key = self._dedupe_key(listing)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(listing)
+        return out
 
     def _is_valid(self, listing: Dict) -> bool:
         if not listing.get("name"):
             return False
-        # Price validation - allow any positive price (rentals ~50-2000, sales ~50000-2000000)
-        price = listing.get("price_per_night") or listing.get("price")
+        if listing.get("url") and not self._looks_like_listing_url(listing.get("url")):
+            return False
+        price = listing.get("price")
         if price is not None and price <= 0:
             return False
         rating = listing.get("rating")
         if rating is not None and not (0 <= rating <= 5):
             return False
-        return True
+        if self._is_generic_name(listing.get("name", "")) and not listing.get("url"):
+            return False
+        return bool(listing.get("url") or listing.get("location") or price is not None or rating is not None)
 
     def _calculate_score(self, listing: Dict) -> float:
-        """Calculate match score based on keywords."""
         score = 5.0
-
-        # Fetch description if we have a URL from the listing site
-        description = ""
-        name = listing.get("name", "")
-        if name.startswith("example-vacation-site.com") or name.startswith("www.example-vacation-site.com"):
-            description = listing.get("description", "")
-            if not description:
-                description = self._fetch_description(name)
-                listing["description"] = description  # Cache it
-
-        # Combine text to check
-        text_to_check = (description + " " + name + " " + listing.get("location", "")).lower()
-
-        # Score based on keywords
+        description = listing.get("description") or ""
+        listing_url = listing.get("url") or ""
+        if listing_url and not self._looks_like_listing_url(listing_url):
+            return 0.0
+        if not description and listing_url and self._looks_like_listing_url(listing_url) and self._desc_fetch_budget > 0:
+            if listing_url not in self._desc_cache:
+                self._desc_cache[listing_url] = self._fetch_description(listing_url)
+                self._desc_fetch_budget -= 1
+            description = self._desc_cache.get(listing_url, "")
+            if description:
+                listing["description"] = description
+        text_to_check = f"{description} {listing.get('name', '')} {listing.get('location') or ''}".lower()
+        text_tokens = set(re.findall(r"\b[a-z0-9]+\b", text_to_check))
         for keyword in self.keywords:
-            if keyword.lower() in text_to_check:
+            kw = keyword.lower().strip()
+            if kw and ((kw in text_tokens) or (" " in kw and kw in text_to_check)):
                 score += 0.5
-
-        # Price bonus (cheaper = higher score)
-        price = listing.get("price_per_night") or 150
-        if price < 100:
-            score += 2.0
-        elif price < 150:
-            score += 1.0
-
+        if self._is_generic_name(listing.get("name", "")):
+            score -= 1.0
+        price = listing.get("price")
+        rental_prompt = any(t in self.prompt_text for t in ["rent", "rental", "night", "hotel", "booking", "airbnb", "apartment", "room"])
+        if rental_prompt and price is not None:
+            if price < 100:
+                score += 2.0
+            elif price < 150:
+                score += 1.0
         return round(min(score, 10.0), 1)
 
-    # Output
-
-    def save(self, filename: str = "results.json"):
+    def save(self, filename: str = None):
+        filename = filename or f"results_{self.session_id}.json"
         out = {
             "session_id": self.session_id,
             "search_date": datetime.now().isoformat(),
@@ -541,15 +759,11 @@ Return JSON with all listings found:""",
             "keywords": self.keywords,
             "results": self.results,
         }
-        with open(filename, "w") as f:
-            json.dump(out, f, indent=2)
-
-        self._track(
-            event="results_saved",
-            input_text=f"Save {len(self.results)} listings",
-            output_text=f"Written to {filename}",
-            props={"filename": filename, "count": len(self.results)},
-        )
+        temp_file = f"{filename}.tmp"
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2, ensure_ascii=False)
+        os.replace(temp_file, filename)
+        self._track(event="results_saved", input_text=f"Save {len(self.results)} listings", output_text=f"Written to {filename}", props={"filename": filename, "count": len(self.results)})
         print(f"Saved to {filename}")
 
     def display(self, results: List[Dict]):
@@ -562,10 +776,9 @@ Return JSON with all listings found:""",
             return
 
         for i, r in enumerate(results, 1):
-            # Build price string with currency support
-            price = r.get("price_per_night") or r.get("price")
-            currency = r.get("currency", "EUR")
-            if price:
+            price = r.get("price")
+            currency = r.get("currency") or "EUR"
+            if price is not None:
                 currency_symbols = {"EUR": "\u20ac", "USD": "$", "GBP": "\u00a3", "HRK": "kn"}
                 symbol = currency_symbols.get(currency, currency)
                 price_str = f"{symbol}{price:,}"
@@ -574,7 +787,7 @@ Return JSON with all listings found:""",
 
             rating_str = f"{r['rating']}/5.0" if r.get("rating") else ""
             print(f"\n{i}. {r['name']}")
-            print(f"   Location: {r.get('location', 'Unknown')}")
+            print(f"   Location: {r.get('location') or 'Unknown'}")
             print(f"   Price: {price_str}   Match Score: {r['match_score']}/10")
             if rating_str:
                 print(f"   Rating: {rating_str}")
@@ -584,16 +797,10 @@ Return JSON with all listings found:""",
         top = results[0]
         print(f"\n{'=' * 65}")
         print(f"Top result: {top['name']}")
-        print(f"   {top.get('location', 'Unknown')}")
+        print(f"   {top.get('location') or 'Unknown'}")
         print("=" * 65)
 
-    # Semantic Query Search (Raindrop Query SDK)
-
     def search_past_runs(self, query: str, limit: int = 10):
-        """
-        Semantic search through past PropertyFinder sessions.
-        Finds runs matching the query by meaning, not just keywords.
-        """
         print(f"\nSearching past runs for: \"{query}\"")
         try:
             client = get_query_client()
@@ -609,10 +816,6 @@ Return JSON with all listings found:""",
             return None
 
     def find_similar(self, description: str, limit: int = 10):
-        """
-        Find past discoveries matching a description.
-        Uses semantic search on user inputs and session data.
-        """
         print(f"\nFinding results similar to: \"{description}\"")
         try:
             client = get_query_client()
@@ -628,9 +831,6 @@ Return JSON with all listings found:""",
             return None
 
     def find_issues(self, limit: int = 10):
-        """
-        Find sessions with failures, slow fetches, or other issues.
-        """
         print(f"\nFinding sessions with issues...")
         try:
             client = get_query_client()
@@ -646,12 +846,10 @@ Return JSON with all listings found:""",
             return None
 
     def display_query_results(self, results, title: str = "Query Results"):
-        """Pretty print semantic search results."""
         print("\n" + "=" * 65)
         print(f"{title}")
         print("=" * 65)
 
-        # Handle Pydantic model response from raindrop-query SDK
         if hasattr(results, 'data'):
             items = results.data
         elif isinstance(results, list):
@@ -664,7 +862,6 @@ Return JSON with all listings found:""",
             return
 
         for i, r in enumerate(items, 1):
-            # Handle Pydantic model - use correct field names from raindrop-query SDK
             event_name = getattr(r, 'event_name', 'unknown')
             user_input = getattr(r, 'user_input', '')[:80]
             assistant_output = getattr(r, 'assistant_output', '')[:80]
@@ -682,28 +879,23 @@ Return JSON with all listings found:""",
             print(f"   Relevance: {relevance:.2f}")
 
         print("\n" + "=" * 65)
-
-    # Run
-
     def run(self, url: str, prompt: str, location: str = None):
-        """
-        Run the property finder with natural language prompt.
-
-        Args:
-            url: URL to search (can be a template with {query} and {location} placeholders)
-            prompt: Natural language description of what to find
-                    e.g., "houses with gardens in Zagreb"
-                          "cheap apartments near city center"
-            location: Optional location parameter for URL template
-        """
-        # Build URL from template if needed
         try:
             final_url = url.format(query=prompt, location=location or "")
         except KeyError:
-            # If template doesn't have all placeholders, use as-is
             final_url = url
+        final_url = normalize_url(final_url)
+        if not final_url:
+            raise ValueError("Invalid final URL")
+        source_domain = urlparse(final_url).netloc.lower().replace("www.", "")
+        if source_domain.endswith("booking.com"):
+            p = urlparse(final_url); q = parse_qs(p.query)
+            if "checkin" not in q or "checkout" not in q:
+                d = datetime.now().date(); q.setdefault("checkin", [(d + timedelta(days=14)).isoformat()]); q.setdefault("checkout", [(d + timedelta(days=16)).isoformat()]); q.setdefault("group_adults", ["2"]); q.setdefault("no_rooms", ["1"]); q.setdefault("group_children", ["0"]); final_url = urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q, doseq=True), p.fragment))
+        self.current_url = final_url
+        self.source_domain = urlparse(final_url).netloc.lower().replace("www.", "")
+        self.prompt_text = prompt.lower()
 
-        # Extract keywords from prompt for scoring
         if not self.keywords:
             self.keywords = self._extract_keywords(prompt)
 
@@ -717,7 +909,7 @@ Return JSON with all listings found:""",
         print("=" * 65)
 
         run_interaction = raindrop.begin(
-            user_id=self.session_id,
+            user_id=self.user_id,
             event="property_finder_run",
             input=f"Find properties at {final_url}",
             properties={"url": final_url, "prompt": prompt, "keywords": self.keywords},
@@ -751,45 +943,9 @@ Return JSON with all listings found:""",
             self.end_session()
             raindrop.flush()
             print(f"\nRaindrop session: {self.session_id}")
-
-# Entry point
-
-def print_usage():
-    print("""
-Property Finder - Usage:
-
-  python PropertyFinder.py --url <url> --prompt <description> [options]
-  python PropertyFinder.py --query <text>                           # Semantic search past runs
-  python PropertyFinder.py --similar <text>                         # Find similar discoveries
-  python PropertyFinder.py --issues                                 # Find sessions with problems
-
-Required Arguments (Search Mode):
-  --url       URL to search (can use {query} and {location} placeholders)
-  --prompt    Natural language description of what to find
-              e.g., "houses with gardens in Zagreb"
-                   "cheap apartments near city center"
-
-Optional Arguments:
-  --location    Location parameter for URL template
-  --keywords    Scoring keywords, comma-separated (default: extracted from prompt)
-
-Examples:
-  # Search with AI-powered extraction
-  python PropertyFinder.py --url "https://example-real-estate.com/houses/zagreb" --prompt "houses with gardens"
-  python PropertyFinder.py --url "https://example-booking-site.com/search?ss=zagreb" --prompt "apartments under 100 euros"
-  python PropertyFinder.py --url "https://example-listing-site.com/venta-viviendas/madrid/" --prompt "affordable apartments in Madrid"
-
-  # Semantic search through past runs
-  python PropertyFinder.py --query "mountain cabin results"
-  python PropertyFinder.py --similar "secluded waterfront cabin"
-  python PropertyFinder.py --issues
-""")
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Property Finder - Search any website for properties/listings",
-        add_help=False,
     )
     parser.add_argument("--url", help="URL to search")
     parser.add_argument("--prompt", help="Natural language description of what to find")
@@ -798,49 +954,45 @@ def main():
     parser.add_argument("--keywords", help="Scoring keywords (comma-separated)")
     parser.add_argument("--similar", help="Find similar past discoveries")
     parser.add_argument("--issues", action="store_true", help="Find sessions with problems")
-    parser.add_argument("--help", "-h", action="store_true", help="Show usage")
+    parser.add_argument("--max-attempts", type=int, default=3, help="Max AI extraction attempts in the agentic loop")
 
     args = parser.parse_args()
-
-    # Show help
-    if args.help:
-        print_usage()
-        return
-
     # Parse keywords
     keywords = []
     if args.keywords:
         keywords = [k.strip() for k in args.keywords.split(",") if k.strip()]
 
-    agent = PropertyFinder(keywords=keywords)
-
-    # --query mode (without --url): semantic search past runs
     if args.query and not args.url:
+        require_env(["RAINDROP_QUERY_API_KEY"])
+        agent = PropertyFinder(keywords=keywords, max_attempts=args.max_attempts)
         results = agent.search_past_runs(args.query)
         agent.display_query_results(results, f"Semantic Search: \"{args.query}\"")
         return
 
-    # --similar mode: find similar discoveries
     if args.similar:
+        require_env(["RAINDROP_QUERY_API_KEY"])
+        agent = PropertyFinder(keywords=keywords, max_attempts=args.max_attempts)
         results = agent.find_similar(args.similar)
         agent.display_query_results(results, f"Similar Results: \"{args.similar}\"")
         return
 
-    # --issues mode: find problematic sessions
     if args.issues:
+        require_env(["RAINDROP_QUERY_API_KEY"])
+        agent = PropertyFinder(keywords=keywords, max_attempts=args.max_attempts)
         results = agent.find_issues()
         agent.display_query_results(results, "Sessions with Issues")
         return
 
-    # Scrape mode: require --url and --prompt
     if args.url and args.prompt:
+        require_env(["STEEL_API_KEY", "OPENAI_API_KEY", "RAINDROP_WRITE_KEY", "RAINDROP_QUERY_API_KEY"])
+        raindrop.init(os.getenv("RAINDROP_WRITE_KEY"))
+        agent = PropertyFinder(keywords=keywords, max_attempts=args.max_attempts)
         results = agent.run(url=args.url, prompt=args.prompt, location=args.location)
         print(f"\nDone! Found {len(results)} results.")
-        print("See results.json for full data.")
+        print(f"See results_{agent.session_id}.json for full data.")
         return
 
-    # No valid arguments
-    print_usage()
+    parser.print_help()
 
 
 if __name__ == "__main__":
