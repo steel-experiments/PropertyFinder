@@ -99,7 +99,6 @@ class PropertyFinder:
         self.max_attempts = max(1, max_attempts)
         self.current_url = ""
         self.source_domain = ""
-        self.prompt_text = ""
         self._session_scrape_param = None
         self.results: List[Dict] = []
         self.keywords = keywords or []
@@ -285,7 +284,7 @@ class PropertyFinder:
                 )
                 listings = self._regex_parse(html)
 
-            # Validate, score, deduplicate
+            # Validate and deduplicate
             valid = []
             seen_keys = set()
             for raw_listing in listings:
@@ -293,7 +292,6 @@ class PropertyFinder:
                 key = self._dedupe_key(listing)
                 if key in seen_keys or not self._is_valid(listing):
                     continue
-                listing["match_score"] = self._calculate_score(listing)
                 valid.append(listing)
                 seen_keys.add(key)
 
@@ -813,29 +811,6 @@ If no healing is needed or unsure, return the original URL unchanged and an empt
             return False
         return bool(listing.get("url") or listing.get("location") or price is not None or rating is not None)
 
-    def _calculate_score(self, listing: Dict) -> float:
-        score = 5.0
-        description = listing.get("description") or ""
-        listing_url = listing.get("url") or ""
-        if listing_url and not self._looks_like_listing_url(listing_url):
-            return 0.0
-        text_to_check = f"{description} {listing.get('name', '')} {listing.get('location') or ''}".lower()
-        text_tokens = set(re.findall(r"\b[a-z0-9]+\b", text_to_check))
-        for keyword in self.keywords:
-            kw = keyword.lower().strip()
-            if kw and ((kw in text_tokens) or (" " in kw and kw in text_to_check)):
-                score += 0.5
-        if self._is_generic_name(listing.get("name", "")):
-            score -= 1.0
-        price = listing.get("price")
-        rental_prompt = any(t in self.prompt_text for t in ["rent", "rental", "night", "hotel", "booking", "airbnb", "apartment", "room"])
-        if rental_prompt and price is not None:
-            if price < 100:
-                score += 2.0
-            elif price < 150:
-                score += 1.0
-        return round(min(score, 10.0), 1)
-
     def save(self, filename: str = None):
         filename = filename or f"results_{self.session_id}.json"
         out = {
@@ -854,7 +829,7 @@ If no healing is needed or unsure, return the original URL unchanged and an empt
 
     def display(self, results: List[Dict]):
         print("\n" + "=" * 65)
-        print("RESULTS - Ranked by Match Score")
+        print("RESULTS")
         print("=" * 65)
 
         if not results:
@@ -874,7 +849,7 @@ If no healing is needed or unsure, return the original URL unchanged and an empt
             rating_str = f"{r['rating']}/5.0" if r.get("rating") else ""
             print(f"\n{i}. {r['name']}")
             print(f"   Location: {r.get('location') or 'Unknown'}")
-            print(f"   Price: {price_str}   Match Score: {r['match_score']}/10")
+            print(f"   Price: {price_str}")
             if rating_str:
                 print(f"   Rating: {rating_str}")
             if r.get("url"):
@@ -948,10 +923,8 @@ If no healing is needed or unsure, return the original URL unchanged and an empt
         if not final_url:
             raise ValueError("Invalid final URL")
         final_url = self._heal_search_url_with_llm(final_url)
-        source_domain = urlparse(final_url).netloc.lower().replace("www.", "")
         self.current_url = final_url
         self.source_domain = urlparse(final_url).netloc.lower().replace("www.", "")
-        self.prompt_text = prompt.lower()
 
         if not self.keywords:
             self.keywords = self._extract_keywords(prompt)
@@ -976,19 +949,18 @@ If no healing is needed or unsure, return the original URL unchanged and an empt
             self.start_session()
             html = self.scrape_url(final_url)
             listings = self.parse_listings(html, user_prompt=prompt)
-            ranked = sorted(listings, key=lambda x: x.get("match_score", 0), reverse=True)
             self.save()
 
-            top_name = ranked[0]["name"] if ranked else "none"
+            top_name = listings[0]["name"] if listings else "none"
             run_interaction.finish(
-                output=f"Found {len(ranked)} results. Top: {top_name}",
-                properties={"results_found": len(ranked)},
+                output=f"Found {len(listings)} results. Top: {top_name}",
+                properties={"results_found": len(listings)},
             )
             self._signal(run_interaction.id, "task_success", "POSITIVE",
-                         {"results_found": len(ranked)})
+                         {"results_found": len(listings)})
 
-            self.display(ranked)
-            return ranked
+            self.display(listings)
+            return listings
 
         except Exception as e:
             run_interaction.finish(output=f"Failed: {e}")
@@ -1008,7 +980,7 @@ def main():
     parser.add_argument("--prompt", help="Natural language description of what to find")
     parser.add_argument("--query", help="Search past runs semantically")
     parser.add_argument("--location", help="Location parameter for URL template", default="")
-    parser.add_argument("--keywords", help="Scoring keywords (comma-separated)")
+    parser.add_argument("--keywords", help="Optional hint keywords (comma-separated)")
     parser.add_argument("--similar", help="Find similar past discoveries")
     parser.add_argument("--issues", action="store_true", help="Find sessions with problems")
     parser.add_argument("--max-attempts", type=int, default=2, help="Max AI extraction attempts in the agentic loop")

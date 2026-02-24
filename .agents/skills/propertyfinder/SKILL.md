@@ -5,7 +5,7 @@ description: Search and extract property listings from any website using Steel b
 
 # PropertyFinder
 
-A CLI tool that gets property listing websites, extracts listings using AI, and ranks results by relevance to your search.
+A CLI tool that gets property listing websites and extracts listings using AI.
 
 ## Quick Start
 
@@ -43,7 +43,7 @@ pip install openai steel raindrop-analytics raindrop-query python-dotenv
 | `--url` | Yes | URL to search (any property listing site) |
 | `--prompt` | Yes | Natural language description of what to find |
 | `--location` | No | Location parameter for URL templates |
-| `--keywords` | No | Override auto-extracted scoring keywords (comma-separated) |
+| `--keywords` | No | Optional hint keywords (comma-separated) |
 
 **Examples:**
 ```bash
@@ -53,7 +53,7 @@ python3 PropertyFinder.py --url "https://example-vacation-rental.com/search?loca
 # Real estate search
 python3 PropertyFinder.py --url "https://example-real-estate.com/listings/split" --prompt "flats between 80 and 100 square meters"
 
-# With custom keywords for better scoring
+# With custom hint keywords
 python3 PropertyFinder.py --url "https://example-real-estate.com/houses/zagreb" --prompt "houses with outdoor space" --keywords "garden,backyard,terrace,patio"
 ```
 
@@ -81,12 +81,11 @@ python3 PropertyFinder.py --similar "waterfront with outdoor space"
 
 1. **Steel** launches a cloud browser, navigates to the URL, and gets rendered HTML
 2. **AI** analyzes the HTML and extracts property listings (names, prices, locations, URLs, ratings)
-3. **Scoring** ranks results based on keyword matches from your prompt
-4. **Raindrop** tracks everything for later semantic search
+3. **Raindrop** tracks everything for later semantic search
 
 ## Output
 
-- **Console**: Ranked results with match scores
+- **Console**: Extracted results
 - **results.json**: Full data in JSON format
 
 Each result contains:
@@ -96,7 +95,6 @@ Each result contains:
 - `currency` - EUR, USD, GBP, HRK
 - `rating` - 0-5 scale if available
 - `url` - Link to listing
-- `match_score` - Relevance score (0-10)
 
 ## Expected Results by Site Type
 
@@ -147,7 +145,7 @@ if args.newflag:
 
 ## Workflow Tips
 
-1. Start with a descriptive `--prompt` - keywords are auto-extracted for scoring
+1. Start with a descriptive `--prompt`
 2. Check `results.json` for complete data
 3. Use `--issues` to diagnose poor results
 4. Use `--similar` to find matching past discoveries

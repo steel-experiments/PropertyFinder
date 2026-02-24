@@ -10,9 +10,8 @@ Searches any property listing website and extracts:
 - Price and Currency
 - Rating (out of 5)
 - URL to listing
-- Match Score (based on your keywords)
 
-Results are ranked by match score and saved to `results_<session_id>.json`.
+Results are saved to `results_<session_id>.json`.
 
 ## Why This Demo?
 
@@ -94,7 +93,7 @@ python PropertyFinder.py --url <url> --prompt "<what you're looking for>"
 
 # Optional Arguments:
 #   --location    Location parameter for URL templates
-#   --keywords    Scoring keywords, comma-separated (default: extracted from prompt)
+#   --keywords    Optional hint keywords, comma-separated
 #   --max-attempts  Max AI extraction attempts (default: 2)
 ```
 
@@ -107,7 +106,7 @@ python PropertyFinder.py --url "https://example-vacation-rental.com/search?locat
 # Real estate search
 python PropertyFinder.py --url "https://example-real-estate.com/listings/split" --prompt "flats between 80 and 100 square meters"
 
-# With custom keywords for better scoring
+# With custom hint keywords
 python PropertyFinder.py --url "https://example-real-estate.com/houses/zagreb" --prompt "houses with outdoor space" --keywords "garden,backyard,terrace,patio"
 
 # URL templates with placeholders
@@ -147,24 +146,24 @@ Fetched 1351946 chars in 5.58s
 Saved to results_search_20260219_135720.json
 
 =====================================================================
-RESULTS - Ranked by Match Score
+RESULTS
 =====================================================================
 
 1. Charming Apartment for Two
    Location: Poreč, Old Town
-   Price: $286   Match Score: 5.0/10
+   Price: $286
    Rating: 5.0/5.0
    URL: /listing/1377529800182448220
 
 2. Studio Apartment Near Beach
    Location: Poreč
-   Price: $306   Match Score: 5.0/10
+   Price: $306
    Rating: 4.78/5.0
    URL: /listing/24710726
 
 3. Room 2min from Beach
    Location: Poreč
-   Price: $245   Match Score: 5.0/10
+   Price: $245
    Rating: 4.84/5.0
    URL: /listing/12921386
 
@@ -194,8 +193,7 @@ Results are saved to `results_<session_id>.json`:
       "price": 286,
       "currency": "USD",
       "rating": 5.0,
-      "url": "/listing/1377529800182448220",
-      "match_score": 5.0
+      "url": "/listing/1377529800182448220"
     }
   ]
 }
@@ -239,16 +237,6 @@ task_success (results_found: 11)
 - `results_found > 0` - Successful searches
 - `duration_seconds > 10` - Slow executions
 - `session_id:search_20260219_135720` - View specific run
-
-## Match Scoring
-
-Each property gets a "match score" (0-10) based on:
-- Keyword matches in name, location, and description
-- Price (cheaper = higher score)
-
-Keywords come from:
-- `--keywords` argument if provided
-- Otherwise, automatically extracted from your `--prompt`
 
 ## Monitoring Benefits
 
