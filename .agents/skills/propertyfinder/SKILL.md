@@ -43,7 +43,6 @@ pip install openai steel raindrop-analytics raindrop-query python-dotenv
 | `--url` | Yes | URL to search (any property listing site) |
 | `--prompt` | Yes | Natural language description of what to find |
 | `--location` | No | Location parameter for URL templates |
-| `--keywords` | No | Optional hint keywords (comma-separated) |
 
 **Examples:**
 ```bash
@@ -53,8 +52,6 @@ python3 PropertyFinder.py --url "https://example-vacation-rental.com/search?loca
 # Real estate search
 python3 PropertyFinder.py --url "https://example-real-estate.com/listings/split" --prompt "flats between 80 and 100 square meters"
 
-# With custom hint keywords
-python3 PropertyFinder.py --url "https://example-real-estate.com/houses/zagreb" --prompt "houses with outdoor space" --keywords "garden,backyard,terrace,patio"
 ```
 
 ### Semantic Search Mode

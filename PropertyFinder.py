@@ -21,6 +21,52 @@ from openai import OpenAI
 _query_client = None
 _openai_client = None
 
+LISTING_LINK_RE = re.compile(
+    r'href=["\']([^"\']*(?:rooms|listing|property|hotel|apartment|home)[^"\']*)["\']',
+    re.IGNORECASE,
+)
+LISTING_PATH_TOKENS = (
+    "/hotel/",
+    "/room/",
+    "/rooms/",
+    "/listing/",
+    "/property/",
+    "/apartment/",
+    "/apartments/",
+    "/home/",
+    "/homes/",
+    "/stay/",
+    "/villa/",
+    "/house/",
+)
+ASSET_PATH_SUFFIXES = (
+    ".css",
+    ".js",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+    ".svg",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".map",
+    ".xml",
+    ".txt",
+    ".json",
+    ".pdf",
+    ".mp4",
+    ".webm",
+)
+CURRENCY_SYMBOLS = {
+    "EUR": "\u20ac",
+    "USD": "$",
+    "GBP": "\u00a3",
+    "HRK": "kn",
+}
+
 def require_env(keys: List[str]):
     missing = [key for key in keys if not os.getenv(key)]
     if missing:
@@ -91,7 +137,7 @@ def get_openai_client() -> OpenAI:
 
 class PropertyFinder:
 
-    def __init__(self, keywords: List[str] = None, max_attempts: int = 2):
+    def __init__(self, max_attempts: int = 2):
         self.session_id = f"search_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.user_id = os.getenv("RAINDROP_USER_ID", "local-cli")
         self.client = None
@@ -101,7 +147,6 @@ class PropertyFinder:
         self.source_domain = ""
         self._session_scrape_param = None
         self.results: List[Dict] = []
-        self.keywords = keywords or []
 
     def _track(self, event: str, input_text: str, output_text: str, props: dict = None):
         raindrop.track_ai(
@@ -227,74 +272,9 @@ class PropertyFinder:
             event="parse_listings",
             input=f"Parse listings from {len(html)} chars of HTML",
         )
-
-        listings = []
-
         try:
-            # --- Strategy 1: AI-powered extraction (preferred) ---
-            if user_prompt:
-                listings = self._extract_with_ai(html, user_prompt)
-                if listings:
-                    self._track(
-                        event="ai_parse_success",
-                        input_text=f"AI extraction for: {user_prompt}",
-                        output_text=f"{len(listings)} listings from AI",
-                        props={"count": len(listings), "method": "ai"},
-                    )
-
-            # --- Strategy 2: structured scripts fallback ---
-            if len(listings) < 3:
-                script_matches = re.findall(
-                    r'<script[^>]+type="application/(ld\+json|json)"[^>]*>(.*?)</script>',
-                    html,
-                    re.DOTALL | re.IGNORECASE,
-                )
-
-                structured_count = 0
-                for script_type, match in script_matches:
-                    try:
-                        data = json.loads(match)
-                    except Exception:
-                        continue
-
-                    if script_type.lower() == "ld+json":
-                        extracted = self._extract_from_json(data, max_depth=8, max_nodes=2500)
-                    else:
-                        lower = match.lower()
-                        if not any(token in lower for token in ["listing", "property", "itemlistelement", "offers", "price"]):
-                            continue
-                        extracted = self._extract_from_json(data, max_depth=7, max_nodes=1200)
-                    structured_count += len(extracted)
-                    listings.extend(extracted)
-
-                if structured_count:
-                    self._track(
-                        event="json_parse_success",
-                        input_text="Parse structured scripts from HTML",
-                        output_text=f"{structured_count} listings from structured scripts",
-                        props={"count": structured_count, "method": "structured_scripts"},
-                    )
-
-            # --- Strategy 3: Regex fallback if AI and JSON-LD gave nothing ---
-            if not listings:
-                self._track(
-                    event="json_parse_empty",
-                    input_text="JSON-LD extraction",
-                    output_text="No listings found, trying regex fallback",
-                )
-                listings = self._regex_parse(html)
-
-            # Validate and deduplicate
-            valid = []
-            seen_keys = set()
-            for raw_listing in listings:
-                listing = self._normalize_listing(raw_listing)
-                key = self._dedupe_key(listing)
-                if key in seen_keys or not self._is_valid(listing):
-                    continue
-                valid.append(listing)
-                seen_keys.add(key)
-
+            listings = self._extract_listings_with_fallbacks(html, user_prompt)
+            valid = self._validate_and_dedupe(listings)
             self.results = valid
 
             sentiment = "POSITIVE" if valid else "NEGATIVE"
@@ -313,6 +293,74 @@ class PropertyFinder:
             self._signal(interaction.id, "parse_failure", "NEGATIVE", {"error": str(e)})
             raise
 
+    def _extract_listings_with_fallbacks(self, html: str, user_prompt: Optional[str]) -> List[Dict]:
+        listings: List[Dict] = []
+
+        if user_prompt:
+            listings = self._extract_with_ai(html, user_prompt)
+            if listings:
+                self._track(
+                    event="ai_parse_success",
+                    input_text=f"AI extraction for: {user_prompt}",
+                    output_text=f"{len(listings)} listings from AI",
+                    props={"count": len(listings), "method": "ai"},
+                )
+
+        if len(listings) < 3:
+            structured = self._parse_structured_scripts(html)
+            if structured:
+                self._track(
+                    event="json_parse_success",
+                    input_text="Parse structured scripts from HTML",
+                    output_text=f"{len(structured)} listings from structured scripts",
+                    props={"count": len(structured), "method": "structured_scripts"},
+                )
+                listings.extend(structured)
+
+        if not listings:
+            self._track(
+                event="json_parse_empty",
+                input_text="JSON-LD extraction",
+                output_text="No listings found, trying regex fallback",
+            )
+            listings = self._regex_parse(html)
+
+        return listings
+
+    def _parse_structured_scripts(self, html: str) -> List[Dict]:
+        script_matches = re.findall(
+            r'<script[^>]+type="application/(ld\+json|json)"[^>]*>(.*?)</script>',
+            html,
+            re.DOTALL | re.IGNORECASE,
+        )
+        extracted_listings: List[Dict] = []
+        for script_type, match in script_matches:
+            data = self._parse_json_value(match)
+            if data is None:
+                continue
+
+            if script_type.lower() == "ld+json":
+                extracted = self._extract_from_json(data, max_depth=8, max_nodes=2500)
+            else:
+                lower = match.lower()
+                if not any(token in lower for token in ["listing", "property", "itemlistelement", "offers", "price"]):
+                    continue
+                extracted = self._extract_from_json(data, max_depth=7, max_nodes=1200)
+            extracted_listings.extend(extracted)
+        return extracted_listings
+
+    def _validate_and_dedupe(self, listings: List[Dict]) -> List[Dict]:
+        valid: List[Dict] = []
+        seen_keys = set()
+        for raw_listing in listings:
+            listing = self._normalize_listing(raw_listing)
+            key = self._dedupe_key(listing)
+            if key in seen_keys or not self._is_valid(listing):
+                continue
+            valid.append(listing)
+            seen_keys.add(key)
+        return valid
+
     def _prepare_content(self, html: str, max_chars: int = 180000) -> str:
         clean = re.sub(r'<(script|style|noscript)[^>]*>.*?</\1>', '', html, flags=re.DOTALL | re.IGNORECASE)
         clean = re.sub(r'<!--.*?-->', '', clean, flags=re.DOTALL)
@@ -321,8 +369,7 @@ class PropertyFinder:
 
     def _extract_candidate_blocks(self, html: str, limit: int = 120) -> List[str]:
         blocks = []
-        href_re = re.compile(r'href=["\']([^"\']*(?:rooms|listing|property|hotel|apartment|home)[^"\']*)["\']', re.IGNORECASE)
-        for match in href_re.finditer(html):
+        for match in LISTING_LINK_RE.finditer(html):
             url = normalize_url(html_lib.unescape(match.group(1)), self.current_url)
             if not url or not self._looks_like_listing_url(url):
                 continue
@@ -336,19 +383,24 @@ class PropertyFinder:
                 break
         return list(dict.fromkeys(blocks))
 
-    def _parse_ai_payload(self, raw: str) -> List[Dict]:
+    def _parse_json_value(self, raw: str) -> Any:
         if not raw:
-            return []
+            return None
         try:
-            data = json.loads(raw)
+            return json.loads(raw)
         except Exception:
             match = re.search(r"\{.*\}", raw, re.DOTALL)
             if not match:
-                return []
+                return None
             try:
-                data = json.loads(match.group(0))
+                return json.loads(match.group(0))
             except Exception:
-                return []
+                return None
+
+    def _parse_ai_payload(self, raw: str) -> List[Dict]:
+        data = self._parse_json_value(raw)
+        if data is None:
+            return []
         if isinstance(data, dict):
             if isinstance(data.get("listings"), list):
                 return data["listings"]
@@ -358,6 +410,17 @@ class PropertyFinder:
                 return data["items"]
             return []
         return data if isinstance(data, list) else []
+
+    def _canonicalize_url(self, raw_url: Any, base_url: str = "") -> Optional[str]:
+        candidate = html_lib.unescape(str(raw_url or ""))
+        if not candidate:
+            return None
+        url = normalize_url(candidate, base_url or self.current_url)
+        if not url:
+            return None
+        parsed = urlparse(url)
+        path = re.sub(r"/+$", "", parsed.path or "") or "/"
+        return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", "", ""))
 
     def _is_generic_name(self, name: str) -> bool:
         value = (name or "").strip().lower()
@@ -373,9 +436,9 @@ class PropertyFinder:
             return False
         if self.source_domain and not host.endswith(self.source_domain):
             return False
-        if path.endswith((".css", ".js", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".map", ".xml", ".txt", ".json", ".pdf", ".mp4", ".webm")):
+        if path.endswith(ASSET_PATH_SUFFIXES):
             return False
-        return any(token in path for token in ("/hotel/", "/room/", "/rooms/", "/listing/", "/property/", "/apartment/", "/apartments/", "/home/", "/homes/", "/stay/", "/villa/", "/house/"))
+        return any(token in path for token in LISTING_PATH_TOKENS)
 
     def _quality(self, listings: List[Dict]) -> Dict[str, float]:
         total = len(listings)
@@ -420,6 +483,60 @@ class PropertyFinder:
                 hints.append(out[:140])
         return "\n".join(hints[:4])
 
+    def _build_ai_chunks(self, html: str) -> List[tuple]:
+        cleaned = self._prepare_content(html)
+        card_blocks = self._extract_candidate_blocks(html)
+        script_blocks = re.findall(
+            r'<script[^>]+type="application/(?:ld\+json|json)"[^>]*>(.*?)</script>',
+            html,
+            re.DOTALL | re.IGNORECASE,
+        )
+        script_blob = "\n\n".join(
+            x[:8000] for x in script_blocks if any(t in x.lower() for t in ["listing", "property", "price", "offers"])
+        )[:60000]
+        chunks = []
+        if card_blocks:
+            chunks.append(("candidate_cards", "\n\n".join(card_blocks)[:100000]))
+        if script_blob:
+            chunks.append(("structured_json", script_blob))
+        clean_chunks = [cleaned[:90000], cleaned[90000:180000]]
+        chunks.extend((f"clean_html_{i+1}", chunk) for i, chunk in enumerate(clean_chunks) if chunk)
+        if not chunks:
+            chunks = [("raw_html", html[:90000])]
+        return chunks
+
+    def _build_ai_instructions(self, telemetry_hints: str, feedback: str) -> str:
+        instructions = (
+            "Extract property/accommodation listings as strict JSON object: "
+            "{\"listings\":[{\"name\":\"\",\"location\":null,\"price\":null,\"currency\":null,\"url\":null,\"rating\":null,\"description\":null}]}. "
+            "Extract as many real listing cards/results as possible. Keep price numeric. "
+            "Do not return CSS/JS/image/static asset URLs; return only real listing detail URLs. "
+            "For each listing, include card-level location and price if visible."
+        )
+        if telemetry_hints:
+            instructions += f"\nPast telemetry hints:\n{telemetry_hints}"
+        if feedback:
+            instructions += f"\nPrevious attempt feedback:\n{feedback}"
+        return instructions
+
+    def _run_ai_iteration(self, client: OpenAI, user_prompt: str, source: str, content: str, instructions: str) -> List[Dict]:
+        response = client.responses.create(
+            model="gpt-5-mini",
+            instructions=instructions,
+            input=f"User intent: {user_prompt}\nSource: {source}\n\nContent:\n{content}\n\nReturn JSON only.",
+            text={"format": {"type": "json_object"}},
+        )
+        parsed = self._parse_ai_payload(response.output_text or "")
+        attempt_listings = [self._normalize_listing(item) for item in parsed if isinstance(item, dict)]
+        return [x for x in attempt_listings if x.get("url") or not self._is_generic_name(x.get("name", ""))]
+
+    def _feedback_from_quality(self, quality: Dict[str, float]) -> str:
+        if quality["url_ratio"] < 0.6:
+            return "Need more real listing URLs. Exclude static assets and non-listing links."
+        if quality["non_generic_ratio"] < 0.6:
+            return "Need real listing titles, not generic names."
+        return "Need more listing prices."
+
     def _extract_with_ai(self, html: str, user_prompt: str) -> List[Dict]:
         interaction = raindrop.begin(
             user_id=self.user_id,
@@ -429,48 +546,17 @@ class PropertyFinder:
 
         try:
             client = get_openai_client()
-            cleaned = self._prepare_content(html)
-            card_blocks = self._extract_candidate_blocks(html)
-            script_blocks = re.findall(r'<script[^>]+type="application/(?:ld\+json|json)"[^>]*>(.*?)</script>', html, re.DOTALL | re.IGNORECASE)
-            script_blob = "\n\n".join(x[:8000] for x in script_blocks if any(t in x.lower() for t in ["listing", "property", "price", "offers"]))[:60000]
-            chunks = []
-            if card_blocks:
-                chunks.append(("candidate_cards", "\n\n".join(card_blocks)[:100000]))
-            if script_blob:
-                chunks.append(("structured_json", script_blob))
-            chunks.extend([(f"clean_html_{i+1}", chunk) for i, chunk in enumerate([cleaned[:90000], cleaned[90000:180000]]) if chunk])
-            if not chunks:
-                chunks = [("raw_html", html[:90000])]
-
+            chunks = self._build_ai_chunks(html)
             telemetry_hints = self._telemetry_hints(user_prompt)
             combined: List[Dict] = []
             feedback = ""
+            quality = self._quality(combined)
             attempts = min(self.max_attempts, len(chunks))
 
             for i in range(attempts):
                 source, content = chunks[i]
-                instructions = (
-                    "Extract property/accommodation listings as strict JSON object: "
-                    "{\"listings\":[{\"name\":\"\",\"location\":null,\"price\":null,\"currency\":null,\"url\":null,\"rating\":null,\"description\":null}]}. "
-                    "Extract as many real listing cards/results as possible. Keep price numeric. "
-                    "Do not return CSS/JS/image/static asset URLs; return only real listing detail URLs. "
-                    "For each listing, include card-level location and price if visible."
-                )
-                if telemetry_hints:
-                    instructions += f"\nPast telemetry hints:\n{telemetry_hints}"
-                if feedback:
-                    instructions += f"\nPrevious attempt feedback:\n{feedback}"
-
-                response = client.responses.create(
-                    model="gpt-5-mini",
-                    instructions=instructions,
-                    input=f"User intent: {user_prompt}\nSource: {source}\n\nContent:\n{content}\n\nReturn JSON only.",
-                    text={"format": {"type": "json_object"}},
-                )
-
-                parsed = self._parse_ai_payload(response.output_text or "")
-                attempt_listings = [self._normalize_listing(item) for item in parsed if isinstance(item, dict)]
-                attempt_listings = [x for x in attempt_listings if x.get("url") or not self._is_generic_name(x.get("name", ""))]
+                instructions = self._build_ai_instructions(telemetry_hints, feedback)
+                attempt_listings = self._run_ai_iteration(client, user_prompt, source, content, instructions)
                 combined = self._dedupe_listings(combined + attempt_listings)
                 quality = self._quality(combined)
 
@@ -483,12 +569,7 @@ class PropertyFinder:
 
                 if quality["good"]:
                     break
-                if quality["url_ratio"] < 0.6:
-                    feedback = "Need more real listing URLs. Exclude static assets and non-listing links."
-                elif quality["non_generic_ratio"] < 0.6:
-                    feedback = "Need real listing titles, not generic names."
-                else:
-                    feedback = "Need more listing prices."
+                feedback = self._feedback_from_quality(quality)
 
             if not quality["good"]:
                 self._track(
@@ -514,16 +595,6 @@ class PropertyFinder:
             self._signal(interaction.id, "ai_extraction_failure", "NEGATIVE", {"error": str(e)})
             self._track(event="ai_extraction_failed", input_text=f"Extract listings for: {user_prompt}", output_text=str(e))
             return []
-
-    def _extract_keywords(self, prompt: str) -> List[str]:
-        stop_words = {
-            "find", "looking", "for", "in", "the", "a", "an", "with", "near",
-            "cheap", "affordable", "want", "need", "please", "show", "search",
-            "apartment", "apartments", "house", "houses", "room", "rooms",
-            "property", "properties", "listing", "listings"
-        }
-        words = re.findall(r'\b[a-zA-Z0-9]{2,}\b', prompt.lower())
-        return [w for w in words if w not in stop_words]
 
     def _infer_location_from_url(self) -> Optional[str]:
         if not self.current_url:
@@ -562,28 +633,9 @@ class PropertyFinder:
         }
         if low in noise:
             return None
-        keyword_set = {k.lower().strip() for k in self.keywords if k}
-        inferred = (self._infer_location_from_url() or "").lower()
-        if low in keyword_set and inferred and low != inferred:
-            return None
         if re.fullmatch(r"\d+", low):
             return None
         return candidate
-
-    def _parse_json_object(self, raw: str) -> dict:
-        if not raw:
-            return {}
-        try:
-            data = json.loads(raw)
-        except Exception:
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            if not match:
-                return {}
-            try:
-                data = json.loads(match.group(0))
-            except Exception:
-                return {}
-        return data if isinstance(data, dict) else {}
 
     def _heal_search_url_with_llm(self, url: str) -> str:
         if not url:
@@ -627,7 +679,9 @@ If no healing is needed or unsure, return the original URL unchanged and an empt
                 input=prompt,
                 text={"format": {"type": "json_object"}},
             )
-            data = self._parse_json_object(response.output_text or "")
+            data = self._parse_json_value(response.output_text or "")
+            if not isinstance(data, dict):
+                return url
             healed = (data.get("healed_url") or "").strip()
             if not healed:
                 return url
@@ -683,14 +737,14 @@ If no healing is needed or unsure, return the original URL unchanged and an empt
         listings = []
         seen = set()
         inferred_location = self._infer_location_from_url()
-        href_re = re.compile(r'href=["\']([^"\']*(?:rooms|listing|property|hotel|apartment|home)[^"\']*)["\']', re.IGNORECASE)
-        for match in href_re.finditer(html):
+        for match in LISTING_LINK_RE.finditer(html):
             url = normalize_url(html_lib.unescape(match.group(1)), self.current_url)
             if not url or not self._looks_like_listing_url(url):
                 continue
-            parsed = urlparse(url)
-            path_key = re.sub(r"/+$", "", parsed.path or "") or "/"
-            canonical = urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path_key, "", "", ""))
+            canonical = self._canonicalize_url(url)
+            if not canonical:
+                continue
+            parsed = urlparse(canonical)
             if canonical in seen:
                 continue
             seen.add(canonical)
@@ -752,12 +806,8 @@ If no healing is needed or unsure, return the original URL unchanged and an empt
                 currency = "USD"
             elif "£" in raw_price or "GBP" in upper:
                 currency = "GBP"
-        raw_url = html_lib.unescape(str(listing.get("url") or listing.get("link") or ""))
-        url = normalize_url(raw_url, self.current_url)
-        if url:
-            parsed = urlparse(url)
-            path = re.sub(r"/+$", "", parsed.path or "") or "/"
-            url = urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", "", ""))
+        raw_url = listing.get("url") or listing.get("link")
+        url = self._canonicalize_url(raw_url)
         if url and not self._looks_like_listing_url(url):
             url = None
         if (not name or self._is_generic_name(name)) and url:
@@ -779,10 +829,9 @@ If no healing is needed or unsure, return the original URL unchanged and an empt
 
     def _dedupe_key(self, listing: Dict):
         if listing.get("url"):
-            parsed = urlparse(html_lib.unescape(listing["url"]))
-            path = re.sub(r"/+$", "", parsed.path or "") or "/"
-            canonical = urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", "", ""))
-            return ("url", canonical)
+            canonical = self._canonicalize_url(listing["url"])
+            if canonical:
+                return ("url", canonical)
         return ("fallback", listing.get("name", "").lower(), (listing.get("location") or "").lower(), listing.get("price"))
 
     def _dedupe_listings(self, listings: List[Dict]) -> List[Dict]:
@@ -817,7 +866,6 @@ If no healing is needed or unsure, return the original URL unchanged and an empt
             "session_id": self.session_id,
             "search_date": datetime.now().isoformat(),
             "total": len(self.results),
-            "keywords": self.keywords,
             "results": self.results,
         }
         temp_file = f"{filename}.tmp"
@@ -840,8 +888,7 @@ If no healing is needed or unsure, return the original URL unchanged and an empt
             price = r.get("price")
             currency = r.get("currency") or "EUR"
             if price is not None:
-                currency_symbols = {"EUR": "\u20ac", "USD": "$", "GBP": "\u00a3", "HRK": "kn"}
-                symbol = currency_symbols.get(currency, currency)
+                symbol = CURRENCY_SYMBOLS.get(currency, currency)
                 price_str = f"{symbol}{price:,}"
             else:
                 price_str = "Price unknown"
@@ -926,15 +973,11 @@ If no healing is needed or unsure, return the original URL unchanged and an empt
         self.current_url = final_url
         self.source_domain = urlparse(final_url).netloc.lower().replace("www.", "")
 
-        if not self.keywords:
-            self.keywords = self._extract_keywords(prompt)
-
         print("\n" + "=" * 65)
         print("PROPERTY FINDER")
         print("=" * 65)
         print(f"URL      : {final_url}")
         print(f"Prompt   : {prompt}")
-        print(f"Keywords : {self.keywords}")
         print(f"Session  : {self.session_id}")
         print("=" * 65)
 
@@ -942,7 +985,7 @@ If no healing is needed or unsure, return the original URL unchanged and an empt
             user_id=self.user_id,
             event="property_finder_run",
             input=f"Find properties at {final_url}",
-            properties={"url": final_url, "prompt": prompt, "keywords": self.keywords},
+            properties={"url": final_url, "prompt": prompt},
         )
 
         try:
@@ -980,34 +1023,29 @@ def main():
     parser.add_argument("--prompt", help="Natural language description of what to find")
     parser.add_argument("--query", help="Search past runs semantically")
     parser.add_argument("--location", help="Location parameter for URL template", default="")
-    parser.add_argument("--keywords", help="Optional hint keywords (comma-separated)")
     parser.add_argument("--similar", help="Find similar past discoveries")
     parser.add_argument("--issues", action="store_true", help="Find sessions with problems")
     parser.add_argument("--max-attempts", type=int, default=2, help="Max AI extraction attempts in the agentic loop")
 
     args = parser.parse_args()
-    # Parse keywords
-    keywords = []
-    if args.keywords:
-        keywords = [k.strip() for k in args.keywords.split(",") if k.strip()]
 
     if args.query and not args.url:
         require_env(["RAINDROP_QUERY_API_KEY"])
-        agent = PropertyFinder(keywords=keywords, max_attempts=args.max_attempts)
+        agent = PropertyFinder(max_attempts=args.max_attempts)
         results = agent.search_past_runs(args.query)
         agent.display_query_results(results, f"Semantic Search: \"{args.query}\"")
         return
 
     if args.similar:
         require_env(["RAINDROP_QUERY_API_KEY"])
-        agent = PropertyFinder(keywords=keywords, max_attempts=args.max_attempts)
+        agent = PropertyFinder(max_attempts=args.max_attempts)
         results = agent.find_similar(args.similar)
         agent.display_query_results(results, f"Similar Results: \"{args.similar}\"")
         return
 
     if args.issues:
         require_env(["RAINDROP_QUERY_API_KEY"])
-        agent = PropertyFinder(keywords=keywords, max_attempts=args.max_attempts)
+        agent = PropertyFinder(max_attempts=args.max_attempts)
         results = agent.find_issues()
         agent.display_query_results(results, "Sessions with Issues")
         return
@@ -1015,7 +1053,7 @@ def main():
     if args.url and args.prompt:
         require_env(["STEEL_API_KEY", "OPENAI_API_KEY", "RAINDROP_WRITE_KEY", "RAINDROP_QUERY_API_KEY"])
         raindrop.init(os.getenv("RAINDROP_WRITE_KEY"))
-        agent = PropertyFinder(keywords=keywords, max_attempts=args.max_attempts)
+        agent = PropertyFinder(max_attempts=args.max_attempts)
         results = agent.run(url=args.url, prompt=args.prompt, location=args.location)
         print(f"\nDone! Found {len(results)} results.")
         print(f"See results_{agent.session_id}.json for full data.")

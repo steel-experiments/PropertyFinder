@@ -93,7 +93,6 @@ python PropertyFinder.py --url <url> --prompt "<what you're looking for>"
 
 # Optional Arguments:
 #   --location    Location parameter for URL templates
-#   --keywords    Optional hint keywords, comma-separated
 #   --max-attempts  Max AI extraction attempts (default: 2)
 ```
 
@@ -105,9 +104,6 @@ python PropertyFinder.py --url "https://example-vacation-rental.com/search?locat
 
 # Real estate search
 python PropertyFinder.py --url "https://example-real-estate.com/listings/split" --prompt "flats between 80 and 100 square meters"
-
-# With custom hint keywords
-python PropertyFinder.py --url "https://example-real-estate.com/houses/zagreb" --prompt "houses with outdoor space" --keywords "garden,backyard,terrace,patio"
 
 # URL templates with placeholders
 python PropertyFinder.py --url "https://example-vacation-rental.com/s/{location}/homes" --location "Colorado" --prompt "secluded mountain cabin"
@@ -135,7 +131,6 @@ PROPERTY FINDER
 =====================================================================
 URL      : https://example-vacation-rental.com/search?location=Porec
 Prompt   : apartments in Porec
-Keywords : ['porec', 'apartments']
 Session  : search_20260219_135720
 =====================================================================
 
@@ -185,7 +180,6 @@ Results are saved to `results_<session_id>.json`:
   "session_id": "search_20260219_135720",
   "search_date": "2026-02-19T13:57:20",
   "total": 11,
-  "keywords": ["porec", "apartments"],
   "results": [
     {
       "name": "Charming Apartment for Two",
