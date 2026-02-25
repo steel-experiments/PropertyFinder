@@ -5,7 +5,7 @@ description: Search and extract property listings from any website using Steel b
 
 # PropertyFinder
 
-A CLI tool that gets property listing websites and extracts listings using AI.
+A CLI tool that navigates property listing websites and extracts listings using AI.
 
 ## Quick Start
 
@@ -31,7 +31,7 @@ OPENAI_API_KEY=sk-...           # AI-powered extraction
 
 Install dependencies:
 ```bash
-pip install openai steel raindrop-analytics raindrop-query python-dotenv
+pip install steel-sdk raindrop-ai raindrop-query python-dotenv openai
 ```
 
 ## CLI Flags
@@ -43,6 +43,7 @@ pip install openai steel raindrop-analytics raindrop-query python-dotenv
 | `--url` | Yes | URL to search (any property listing site) |
 | `--prompt` | Yes | Natural language description of what to find |
 | `--location` | No | Location parameter for URL templates |
+| `--max-attempts` | No | Max AI extraction attempts in the agentic loop (default: 2) |
 
 **Examples:**
 ```bash
@@ -83,7 +84,7 @@ python3 PropertyFinder.py --similar "waterfront with outdoor space"
 ## Output
 
 - **Console**: Extracted results
-- **results.json**: Full data in JSON format
+- **results_<session_id>.json**: Full data in JSON format
 
 Each result contains:
 - `name` - Property title
@@ -92,6 +93,7 @@ Each result contains:
 - `currency` - EUR, USD, GBP, HRK
 - `rating` - 0-5 scale if available
 - `url` - Link to listing
+- `description` - Optional card/snippet description when available
 
 ## Expected Results by Site Type
 
@@ -120,7 +122,8 @@ Each result contains:
 
 When debugging, check these metrics in traces:
 - `raw_count` vs `valid_count` - if raw is high but valid is low, validation may be filtering results
-- `prices_found` and `urls_found` - indicates HTML quality
+- `url_ratio`, `price_ratio`, and `non_generic_ratio` - AI extraction quality signals
+- `urls_found` - URL coverage from regex fallback parsing
 - Recent traces take a few minutes to index
 
 ## Adding New CLI Flags
@@ -138,12 +141,12 @@ if args.newflag:
     # Handle new flag
 ```
 
-3. Update `print_usage()` to document it
+3. Update CLI documentation in `README.md` and this skill file
 
 ## Workflow Tips
 
 1. Start with a descriptive `--prompt`
-2. Check `results.json` for complete data
+2. Check `results_<session_id>.json` for complete data
 3. Use `--issues` to diagnose poor results
 4. Use `--similar` to find matching past discoveries
 5. Watch the Steel session URL to see retrieval progress

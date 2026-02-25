@@ -44,7 +44,7 @@ Every action is logged to Raindrop:
 ### 1. Install Dependencies
 
 ```bash
-pip install steel-browser raindrop-ai raindrop-query python-dotenv openai
+pip install steel-sdk raindrop-ai raindrop-query python-dotenv openai
 ```
 
 ### 2. Get API Keys
@@ -148,19 +148,19 @@ RESULTS
    Location: Poreč, Old Town
    Price: $286
    Rating: 5.0/5.0
-   URL: /listing/1377529800182448220
+   URL: https://example-vacation-rental.com/listing/1377529800182448220
 
 2. Studio Apartment Near Beach
    Location: Poreč
    Price: $306
    Rating: 4.78/5.0
-   URL: /listing/24710726
+   URL: https://example-vacation-rental.com/listing/24710726
 
 3. Room 2min from Beach
    Location: Poreč
    Price: $245
    Rating: 4.84/5.0
-   URL: /listing/12921386
+   URL: https://example-vacation-rental.com/listing/12921386
 
 =====================================================================
 Top result: Charming Apartment for Two
@@ -187,7 +187,7 @@ Results are saved to `results_<session_id>.json`:
       "price": 286,
       "currency": "USD",
       "rating": 5.0,
-      "url": "/listing/1377529800182448220"
+      "url": "https://example-vacation-rental.com/listing/1377529800182448220"
     }
   ]
 }
